@@ -26,14 +26,22 @@ html, body {
 body {
   font-family: ui-rounded, "SF Pro Rounded", "Segoe UI", Roboto, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
   color: #f2fbf5;
-  position: fixed; inset: 0;
+  position: relative;
 }
 button { font-family: inherit; -webkit-tap-highlight-color: transparent; }
 
 /* ============================================================
    APP SHELL
    ============================================================ */
-#app { position: absolute; inset: 0; }
+/* #app carries the page's height so the document has a real, measurable
+   size. JS overwrites this with an exact pixel height (see syncAppHeight). */
+#app {
+  position: relative;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
 
 #game {
   position: absolute; inset: 0;
@@ -65,7 +73,18 @@ button { font-family: inherit; -webkit-tap-highlight-color: transparent; }
   text-align: center;
   z-index: 20;
   opacity: 1;
+  overflow-y: auto;
   transition: opacity .32s ease;
+}
+/* Short frames (embedded panels, landscape): shrink the home furniture
+   instead of pushing it off the top. */
+@media (max-height: 640px) {
+  #home .tee { width: 76px; height: 76px; margin-bottom: 4px; }
+  #home .logo { margin-bottom: 0; }
+  .screen { gap: 12px; }
+  .title { font-size: clamp(30px, 10vw, 44px); }
+  .btn { min-height: 52px; font-size: 18px; }
+  .hint { display: none; }
 }
 .screen.hidden { opacity: 0; pointer-events: none; }
 .screen.gone { display: none; }
@@ -1008,6 +1027,7 @@ function sinkBall() {
    painted once into an offscreen canvas; each frame only redraws the things
    that actually move. That keeps mobile frame rates comfortable.
    ========================================================================== */
+const appEl = document.getElementById("app");
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
 const staticCv = document.createElement("canvas");
@@ -1020,10 +1040,31 @@ const bctx = bgCv.getContext("2d");
 let view = { scale: 1, ox: 0, oy: 0, dpr: 1, cw: 0, ch: 0 };
 let staticDirty = true;
 
+/** Give #app an exact pixel height. Falls back to a portrait box derived from
+    the width when the viewport reports something degenerate, which is what
+    happens inside a frame that is sized to its content. */
+function syncAppHeight() {
+  const vv = window.visualViewport;
+  const w = Math.round((vv && vv.width) || window.innerWidth || 360);
+  let h = Math.round((vv && vv.height) || window.innerHeight || 0);
+  const embedded = window.top !== window.self;
+  // A frame that is sized to its content starts out collapsed, so there is no
+  // real height to read; fall back to a portrait box derived from the width.
+  // A genuinely short viewport (landscape phone) is left alone.
+  if (embedded && h < 280) h = Math.min(Math.round(w * 1.55), 780);
+  if (h < 1) h = 600;
+  appEl.style.height = h + "px";
+}
+
 function resize() {
-  const cw = Math.max(1, window.innerWidth);
-  const ch = Math.max(1, window.innerHeight);
+  syncAppHeight();
+  const box = appEl.getBoundingClientRect();
+  const cw = Math.max(1, Math.round(box.width));
+  const ch = Math.max(1, Math.round(box.height));
   const dpr = Math.min(window.devicePixelRatio || 1, 2); // cap for mobile perf
+  // Bail out when nothing actually changed — resize() writes to the DOM, and
+  // the ResizeObserver below would otherwise feed itself forever.
+  if (cw === view.cw && ch === view.ch && dpr === view.dpr) return;
   canvas.width = Math.round(cw * dpr);
   canvas.height = Math.round(ch * dpr);
   canvas.style.width = cw + "px";
@@ -1063,6 +1104,9 @@ function drawBackdrop() {
 }
 window.addEventListener("resize", resize);
 window.addEventListener("orientationchange", () => setTimeout(resize, 180));
+if (window.visualViewport) window.visualViewport.addEventListener("resize", resize);
+// An embedded host can resize the frame without firing a window resize event.
+if (window.ResizeObserver) new ResizeObserver(() => resize()).observe(document.documentElement);
 
 /* -------- rounded rectangle path (works on every browser) ---------------- */
 function rr(c, x, y, w, h, r, keepPath) {
@@ -1548,7 +1592,9 @@ if (window.PointerEvent) {
   window.addEventListener("mouseup", () => inputEnd("m"));
 }
 // Belt and braces: stop the page itself from ever scrolling / zooming.
-document.addEventListener("touchmove", e => { if (!e.target.closest || !e.target.closest(".card-scroll")) e.preventDefault(); }, { passive: false });
+document.addEventListener("touchmove", e => {
+  if (!e.target.closest || !e.target.closest(".card-scroll, .screen")) e.preventDefault();
+}, { passive: false });
 document.addEventListener("gesturestart", e => e.preventDefault());
 document.addEventListener("contextmenu", e => e.preventDefault());
 
