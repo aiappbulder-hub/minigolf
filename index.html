@@ -235,6 +235,27 @@ button { font-family: inherit; -webkit-tap-highlight-color: transparent; }
 }
 #coach.show { opacity: 1; }
 
+/* Hole name banner, shown as each hole starts */
+#banner {
+  position: absolute; left: 50%; top: calc(70px + var(--sat));
+  transform: translate(-50%, -8px); opacity: 0;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 8px 18px; border-radius: 16px;
+  background: rgba(6,28,18,.62); border: 1px solid rgba(255,255,255,.14);
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  transition: opacity .35s ease, transform .35s ease;
+  pointer-events: none; white-space: nowrap;
+}
+#banner.show { opacity: 1; transform: translate(-50%, 0); }
+#banner b { font-size: 17px; font-weight: 900; color: #fff; letter-spacing: .2px; }
+#banner span { font-size: 10.5px; letter-spacing: 1.4px; text-transform: uppercase; color: var(--gold); font-weight: 800; }
+.icon-btn.active { background: rgba(255,215,106,.24); border-color: rgba(255,215,106,.6); }
+.icon-btn:focus-visible, .btn:focus-visible { outline: 3px solid var(--gold); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  #banner, .screen, #coach { transition: none; }
+  #home .tee { animation: none; }
+}
+
 /* Power meter */
 #power {
   width: min(300px, 78vw); height: 12px; border-radius: 999px;
@@ -334,10 +355,12 @@ button { font-family: inherit; -webkit-tap-highlight-color: transparent; }
         <div class="chip panel accent"><b id="hudTotal">E</b><span>Total</span></div>
       </div>
       <div class="hud-btns">
+        <button class="icon-btn" id="btnView" aria-label="Show the whole hole">&#128506;</button>
         <button class="icon-btn" id="btnMute" aria-label="Toggle sound">&#128266;</button>
         <button class="icon-btn" id="btnMenu" aria-label="Quit to menu">&#10005;</button>
       </div>
     </div>
+    <div id="banner" aria-live="polite"><b id="bnName">Opening Drive</b><span id="bnMeta">Hole 1 &middot; Par 2</span></div>
     <div class="hud-bottom">
       <div id="coach">Drag anywhere to aim &middot; release to putt</div>
       <div id="power"><i></i></div>
@@ -394,29 +417,32 @@ button { font-family: inherit; -webkit-tap-highlight-color: transparent; }
 "use strict";
 /* ============================================================================
    POCKET PUTT — a tiny 18-hole mini golf game.
-   Sections:  CONFIG · LEVEL DATA · STORAGE · AUDIO · STATE · PHYSICS ·
-              RENDER · INPUT · SCREENS · MAIN LOOP
-   All coordinates are in "world units": the course is a fixed 400 x 620 box
-   that gets scaled to fit whatever screen it lands on.
+   Sections:  CONFIG · LEVEL DATA · SMALL HELPERS · GEOMETRY · STORAGE ·
+              AUDIO · GAME STATE · PHYSICS · PARTICLES · RENDERING · CAMERA ·
+              INPUT · SCREENS · MAIN LOOP
+   Every hole is a polygon outline in "world units" (roughly 400 wide and up
+   to ~1400 long). A camera follows the ball and scales the world to fit the
+   screen, so long holes scroll while short ones fit on screen whole.
    ========================================================================== */
 
 /* ============================ CONFIG ====================================== */
-const W = 400;                 // course width  (world units)
-const H = 620;                 // course height (world units)
-const WALL = 14;               // thickness of the outer border wall
+const RAIL = 12;               // thickness of the wooden rail drawn outside an edge
 const BALL_R = 7;              // ball radius
-const HOLE_R = 12;             // hole radius
-const MAX_DRAG = 148;          // drag length (world units) that equals 100% power
-const MIN_DRAG = 9;            // shorter than this cancels the shot
+const HOLE_R = 12;             // cup radius
+const MAX_DRAG_PX = 150;       // finger drag (CSS px) that equals 100% power
+const MIN_DRAG_PX = 9;         // shorter than this is a tap, not a shot
 const SHOT_MIN = 165;          // speed at 1% power
-const SHOT_MAX = 985;          // speed at 100% power
-const FRICTION_GRASS = 1.55;   // exponential damping coefficient (per second)
+const SHOT_MAX = 1050;         // speed at 100% power
+const FRICTION_GRASS = 1.45;   // exponential damping coefficient (per second)
 const FRICTION_SAND = 7.2;
 const STOP_SPEED = 11;         // below this the ball is parked
-const WALL_BOUNCE = 0.74;      // restitution against walls
+const WALL_BOUNCE = 0.74;      // restitution against rails and blocks
 const BUMPER_BOUNCE = 1.18;    // bumpers give energy back
+const SPIN_HALF = 5.5;         // half thickness of a windmill blade
 const SINK_SPEED = 430;        // max speed at which the ball can drop in
 const FIXED_DT = 1 / 120;      // physics timestep
+const VIEW_SPAN = 700;         // course length the follow camera tries to show
+const PAD = 70;                // margin baked around a course (rails, shadow, trees)
 
 const RATINGS = {              // strokes-minus-par -> label
   "-4": "Condor", "-3": "Albatross", "-2": "Eagle", "-1": "Birdie", "0": "Par",
@@ -424,98 +450,172 @@ const RATINGS = {              // strokes-minus-par -> label
 };
 
 /* ============================ LEVEL DATA ==================================
-   walls / sand / water / boost : [x, y, w, h]  (boost adds ax, ay)
-   bumpers                      : [x, y, r]
-   movers                       : [x, y, w, h, travelX, travelY, period, phase]
-   Every course also gets the four border walls added automatically.
+   shape                 : course outline, a simple polygon [[x,y], ...]
+   walls                 : interior wooden blocks [x, y, w, h]
+   sand / water / boost  : [x, y, w, h] or { pts: [[x,y], ...] }
+                           (boost appends the push direction: ax, ay)
+   bumpers               : [x, y, r]
+   movers                : [x, y, w, h, travelX, travelY, period, phase]
+   spinners (windmills)  : [x, y, armLength, radiansPerSecond, startAngle]
+   Hazards may overhang the outline; they are clipped to the course.
    ========================================================================== */
+
+/** Points along a circular arc, angles in degrees, a0 -> a1 inclusive. */
+function arcPts(cx, cy, r, a0, a1, n) {
+  const out = [];
+  for (let i = 0; i <= n; i++) {
+    const a = (a0 + (a1 - a0) * i / n) * Math.PI / 180;
+    out.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+  }
+  return out;
+}
+/** A vertical pill: straight sides with round caps top and bottom. */
+function stadiumPts(x0, y0, x1, y1) {
+  const r = (x1 - x0) / 2, cx = (x0 + x1) / 2;
+  return arcPts(cx, y0 + r, r, 180, 360, 18).concat(arcPts(cx, y1 - r, r, 0, 180, 18));
+}
+function ellipsePts(cx, cy, rx, ry, n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const a = i / n * Math.PI * 2;
+    out.push([cx + Math.cos(a) * rx, cy + Math.sin(a) * ry]);
+  }
+  return out;
+}
+/** A corridor of constant width whose walls snake from side to side. */
+function wavyPts(x0, x1, y0, y1, amp, period) {
+  const right = [], left = [];
+  const n = Math.ceil((y1 - y0) / 22);
+  for (let i = 0; i <= n; i++) {
+    const y = y0 + (y1 - y0) * i / n, s = Math.sin(y / period);
+    right.push([x1 - amp * (0.5 + 0.5 * s), y]);
+    left.push([x0 + amp * (0.5 - 0.5 * s), y]);
+  }
+  return right.concat(left.reverse());
+}
+
 const LEVELS = [
-  { // 1 — the friendly straight-away
-    par: 2, start: [200, 520], hole: [200, 150], name: "Opening Drive"
+  { // 1 — a friendly pill-shaped green
+    name: "Opening Drive", par: 2,
+    shape: stadiumPts(90, 30, 310, 640),
+    start: [200, 570], hole: [200, 140]
   },
-  { // 2 — one block to go around
-    par: 2, start: [200, 530], hole: [130, 120], name: "Sidestep",
-    walls: [[170, 300, 140, 26]]
+  { // 2 — the first long hole: an L that turns right at the top
+    name: "Dogleg", par: 3,
+    shape: [[40, 40], [370, 40], [370, 220], [210, 220], [210, 880], [40, 880]],
+    start: [125, 820], hole: [300, 130]
   },
-  { // 3 — the corner
-    par: 3, start: [80, 520], hole: [320, 140], name: "Dogleg",
-    walls: [[14, 300, 250, 26]]
+  { // 3 — diagonal walls funnel into a narrow waist
+    name: "Hourglass", par: 3,
+    shape: [[40, 40], [360, 40], [360, 240], [245, 370], [245, 450], [360, 580], [360, 820],
+            [40, 820], [40, 580], [155, 450], [155, 370], [40, 240]],
+    start: [200, 760], hole: [200, 120]
   },
-  { // 4 — narrow passages
-    par: 3, start: [200, 545], hole: [200, 110], name: "Threading",
-    walls: [[14, 330, 152, 24], [240, 330, 146, 24], [14, 200, 116, 24], [204, 200, 182, 24]]
+  { // 4 — a Z with two hard corners
+    name: "Zig Zag", par: 4,
+    shape: [[40, 40], [360, 40], [360, 700], [180, 700], [180, 1060], [40, 1060],
+            [40, 560], [220, 560], [220, 180], [40, 180]],
+    start: [110, 1000], hole: [95, 110]
   },
-  { // 5 — bumpers
-    par: 3, start: [200, 540], hole: [200, 110], name: "Pinball",
-    bumpers: [[130, 350, 20], [270, 350, 20], [200, 235, 22]]
+  { // 5 — bumpers inside a hexagon
+    name: "Pinball", par: 3,
+    shape: [[200, 40], [360, 190], [360, 650], [200, 800], [40, 650], [40, 190]],
+    start: [200, 730], hole: [200, 140],
+    bumpers: [[130, 430, 20], [270, 430, 20], [200, 330, 22], [115, 250, 16], [285, 250, 16], [200, 560, 14]]
   },
-  { // 6 — sand trap in the middle
-    par: 3, start: [200, 545], hole: [200, 110], name: "The Beach",
-    sand: [[110, 240, 180, 150]]
+  { // 6 — a long oval beach with bunkers
+    name: "The Beach", par: 3,
+    shape: ellipsePts(200, 480, 165, 445, 64),
+    start: [200, 860], hole: [200, 110],
+    sand: [[120, 420, 160, 110], [250, 160, 80, 60], [70, 600, 80, 70]]
   },
-  { // 7 — water either side of a channel
-    par: 3, start: [200, 545], hole: [200, 120], name: "The Narrows",
-    water: [[14, 290, 150, 100], [236, 290, 150, 100]]
+  { // 7 — a round green through a keyhole, past two ponds
+    name: "The Keyhole", par: 3,
+    shape: arcPts(200, 200, 150, 109.47, 430.53, 44)
+      .concat([[250, 420], [360, 420], [360, 900], [40, 900], [40, 420], [150, 420]]),
+    start: [200, 850], hole: [200, 170],
+    water: [[40, 560, 120, 110], [240, 560, 120, 110]]
   },
-  { // 8 — zig zag
-    par: 4, start: [335, 555], hole: [200, 110], name: "Switchback",
-    walls: [[14, 470, 270, 22], [116, 350, 270, 22], [14, 230, 270, 22]]
+  { // 8 — up one side, round the top, down the other
+    name: "Horseshoe", par: 4,
+    shape: [[40, 40], [360, 40], [360, 900], [230, 900], [230, 210], [170, 210], [170, 900], [40, 900]],
+    start: [105, 840], hole: [295, 830],
+    bumpers: [[200, 115, 16]]
   },
-  { // 9 — first moving obstacle
-    par: 3, start: [200, 545], hole: [200, 110], name: "Timing",
-    walls: [[14, 290, 52, 92], [334, 290, 52, 92]],
-    movers: [[66, 290, 64, 92, 204, 0, 3.2, 0]]
+  { // 9 — two sliding blocks to time
+    name: "Timing", par: 3,
+    shape: [[80, 40], [320, 40], [360, 80], [360, 880], [320, 920], [80, 920], [40, 880], [40, 80]],
+    start: [200, 860], hole: [200, 120],
+    movers: [[50, 580, 90, 36, 220, 0, 3.2, 0], [260, 340, 90, 36, -210, 0, 3.8, 0.3]]
   },
-  { // 10 — speed ramp
-    par: 3, start: [200, 555], hole: [200, 88], name: "The Ramp",
-    boost: [[160, 300, 80, 130, 0, -1100]],
-    sand: [[150, 140, 100, 70]]
+  { // 10 — a narrow ramp that launches you onto the green
+    name: "The Ramp", par: 3,
+    shape: [[40, 40], [360, 40], [360, 520], [262, 620], [262, 1000], [138, 1000], [138, 620], [40, 520]],
+    start: [200, 950], hole: [200, 110],
+    boost: [[150, 650, 100, 200, 0, -1100]],
+    sand: [[110, 200, 180, 90]]
   },
-  { // 11 — island green over a bridge
-    par: 4, start: [200, 555], hole: [80, 80], name: "Island Green",
-    water: [[14, 150, 280, 110], [346, 150, 40, 110]]
+  { // 11 — an island green ringed by water, one bridge in
+    name: "Island Green", par: 3,
+    shape: [[40, 40], [360, 40], [360, 1000], [40, 1000]],
+    start: [200, 940], hole: [200, 230],
+    water: [{ pts: arcPts(200, 230, 150, 98.82, 441.18, 52).concat(arcPts(200, 230, 80, 433.29, 106.71, 30)) }],
+    walls: [[120, 620, 160, 22]]
   },
-  { // 12 — bank shot into a pocket
-    par: 4, start: [200, 560], hole: [320, 110], name: "Bank Job",
-    walls: [[238, 86, 20, 150], [258, 216, 128, 20]],
-    bumpers: [[140, 360, 20]]
+  { // 12 — the boot: bank off the diagonal into the toe
+    name: "Bank Job", par: 3,
+    shape: [[40, 40], [300, 40], [360, 100], [360, 880], [220, 880], [220, 230], [40, 230]],
+    start: [290, 820], hole: [100, 135]
   },
-  { // 13 — bumper garden then a gate
-    par: 4, start: [200, 545], hole: [200, 80], name: "Bumper Garden",
-    walls: [[14, 380, 140, 22], [246, 380, 140, 22]],
-    bumpers: [[200, 300, 18], [110, 210, 17], [290, 210, 17]],
-    sand: [[150, 120, 100, 66]]
+  { // 13 — twin windmills guard the gate
+    name: "Windmills", par: 3,
+    shape: stadiumPts(40, 40, 360, 1000),
+    start: [200, 930], hole: [200, 130],
+    walls: [[40, 480, 128, 36], [232, 480, 128, 36]],
+    spinners: [[120, 600, 72, 1.6, 0], [280, 600, 72, -1.6, 0]],
+    bumpers: [[140, 210, 16], [260, 210, 16]]
   },
-  { // 14 — sand + water + a long gate
-    par: 4, start: [300, 555], hole: [70, 110], name: "Low Tide",
-    water: [[14, 430, 120, 80]],
-    sand: [[190, 300, 160, 120]],
-    walls: [[150, 210, 236, 22]]
+  { // 14 — a slanted course with sand and a pond
+    name: "Low Tide", par: 3,
+    shape: [[40, 40], [200, 40], [360, 420], [360, 1000], [200, 1000], [40, 620]],
+    start: [280, 940], hole: [110, 110],
+    water: [[40, 290, 105, 100]],
+    sand: [[150, 480, 130, 90]]
   },
-  { // 15 — two movers
-    par: 4, start: [200, 555], hole: [200, 80], name: "Traffic",
-    walls: [[14, 420, 40, 80], [346, 420, 40, 80], [14, 220, 40, 80], [346, 220, 40, 80]],
-    movers: [[54, 420, 80, 80, 212, 0, 3.0, 0], [266, 220, 80, 80, -212, 0, 3.6, 0.5]]
+  { // 15 — rush hour: two sliders and a windmill
+    name: "Traffic", par: 4,
+    shape: arcPts(200, 200, 160, 180, 360, 22).concat([[360, 1100], [40, 1100]]),
+    start: [200, 1040], hole: [200, 150],
+    movers: [[40, 820, 100, 36, 220, 0, 3.0, 0], [260, 600, 100, 36, -220, 0, 3.6, 0.5]],
+    spinners: [[200, 380, 70, -1.3, 0.6]]
   },
-  { // 16 — long channels
-    par: 3, start: [200, 560], hole: [60, 70], name: "The Chimney",
-    walls: [[110, 120, 22, 386], [268, 220, 22, 386]],
-    bumpers: [[320, 150, 18]]
+  { // 16 — a tall chimney of ledges up to a side room
+    name: "The Chimney", par: 4,
+    shape: [[40, 40], [360, 40], [360, 270], [270, 270], [270, 1100], [130, 1100], [130, 270], [40, 270]],
+    start: [200, 1050], hole: [80, 110],
+    walls: [[130, 820, 75, 20], [195, 620, 75, 20], [130, 420, 75, 20]],
+    bumpers: [[300, 150, 16]]
   },
-  { // 17 — ramp through the gap onto a sandy green
-    par: 4, start: [200, 560], hole: [200, 70], name: "Launch Pad",
-    boost: [[150, 440, 100, 70, 0, -900]],
-    water: [[14, 250, 150, 90], [236, 250, 150, 90]],
-    sand: [[120, 120, 160, 70]],
-    bumpers: [[80, 350, 18], [320, 350, 18]]
+  { // 17 — a snaking corridor with a launch pad between ponds
+    name: "Launch Pad", par: 4,
+    shape: wavyPts(40, 360, 40, 1100, 70, 110),
+    start: [200, 1050], hole: [200, 110],
+    boost: [[150, 760, 100, 120, 0, -1000]],
+    water: [[20, 480, 150, 80], [240, 480, 160, 80]],
+    sand: [[130, 170, 140, 60]]
   },
-  { // 18 — the finale: everything at once
-    par: 5, start: [200, 570], hole: [70, 90], name: "Grand Finale",
-    walls: [[14, 470, 250, 22], [116, 340, 270, 22], [130, 180, 256, 22]],
-    water: [[312, 380, 74, 60]],
-    sand: [[14, 250, 110, 80]],
-    bumpers: [[210, 290, 18]],
-    movers: [[140, 390, 60, 50, 100, 0, 3.4, 0]]
+  { // 18 — the finale: a serpentine with everything in it
+    name: "Grand Finale", par: 5,
+    shape: [[40, 40], [360, 40], [360, 460], [180, 460], [180, 780], [360, 780], [360, 1380],
+            [40, 1380], [40, 1240], [220, 1240], [220, 920], [40, 920], [40, 320], [220, 320],
+            [220, 180], [40, 180]],
+    start: [100, 1310], hole: [90, 110],
+    boost: [[240, 980, 100, 200, 0, -800]],
+    movers: [[50, 830, 80, 40, 180, 0, 3.2, 0]],
+    sand: [[40, 560, 140, 90]],
+    spinners: [[200, 390, 60, 1.5, 0]],
+    water: [[300, 1300, 60, 80]],
+    bumpers: [[230, 110, 16]]
   }
 ];
 const HOLE_COUNT = LEVELS.length;
@@ -533,15 +633,67 @@ function mulberry32(seed) {
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
-const rectHit = (x, y, r, R) =>
-  x > R.x - r && x < R.x + R.w + r && y > R.y - r && y < R.y + R.h + r;
-const pointIn = (x, y, R) => x > R.x && x < R.x + R.w && y > R.y && y < R.y + R.h;
+const rectPts = (x, y, w, h) => [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+
+/* ============================ GEOMETRY ====================================
+   Courses are polygons, so collision is circle-vs-segment. A segment keeps
+   its bounding box for a cheap early-out.
+   ========================================================================== */
+function makeSeg(ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  return {
+    ax, ay, bx, by, dx, dy, len2: (dx * dx + dy * dy) || 1e-9,
+    minx: Math.min(ax, bx), maxx: Math.max(ax, bx),
+    miny: Math.min(ay, by), maxy: Math.max(ay, by)
+  };
+}
+function polySegs(pts) {
+  const out = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    if (a[0] !== b[0] || a[1] !== b[1]) out.push(makeSeg(a[0], a[1], b[0], b[1]));
+  }
+  return out;
+}
+function polyBox(pts) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of pts) {
+    if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+    if (p[1] < y0) y0 = p[1]; if (p[1] > y1) y1 = p[1];
+  }
+  return { x0, y0, x1, y1, w: x1 - x0, h: y1 - y0 };
+}
+/** Even-odd ray cast; works for any simple polygon, convex or not. */
+function pointInPoly(x, y, pts) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+/** Is a point inside an area (sand/water/boost)? Box test first. */
+function inArea(x, y, A) {
+  const b = A.box;
+  return x > b.x0 && x < b.x1 && y > b.y0 && y < b.y1 && pointInPoly(x, y, A.pts);
+}
+function distToSeg(x, y, s) {
+  let t = ((x - s.ax) * s.dx + (y - s.ay) * s.dy) / s.len2;
+  t = t < 0 ? 0 : (t > 1 ? 1 : t);
+  return Math.hypot(x - (s.ax + s.dx * t), y - (s.ay + s.dy * t));
+}
+function distToSegs(x, y, segs) {
+  let m = Infinity;
+  for (const s of segs) { const d = distToSeg(x, y, s); if (d < m) m = d; }
+  return m;
+}
 
 /* ============================ STORAGE =====================================
    All localStorage access is wrapped: private-mode Safari and disabled
    storage must never break the game.
    ========================================================================== */
-const SAVE_KEY = "pocketputt.v1";
+// v2: the course was redesigned, so v1 per-hole bests no longer apply.
+const SAVE_KEY = "pocketputt.v2";
 const Store = {
   data: { unlocked: 1, bestTotal: null, bestHole: [], progress: null, muted: false },
   load() {
@@ -655,8 +807,8 @@ const Game = {
   ball: { x: 0, y: 0, vx: 0, vy: 0, moving: false, sunk: false, inSand: false },
   shotOrigin: { x: 0, y: 0 },
   aiming: false,
-  aimStart: { x: 0, y: 0 },
-  aimNow: { x: 0, y: 0 },
+  aimStart: { x: 0, y: 0 },   // screen px — aiming is measured on screen so a
+  aimNow: { x: 0, y: 0 },     // moving camera never skews the shot
   power: 0,
   time: 0,               // seconds since the hole loaded (drives movers)
   shake: 0,
@@ -664,74 +816,109 @@ const Game = {
   sinkT: 0,
   particles: [],
   ripples: [],
+  trail: [],
   transition: 1          // 0..1 fade-in when a hole loads
 };
 
-/* --------- compile raw level data into runtime objects (adds borders) ----- */
+/* --------- compile raw level data into runtime objects -------------------- */
+function toArea(a) {
+  const pts = Array.isArray(a) ? rectPts(a[0], a[1], a[2], a[3]) : a.pts;
+  const out = { pts, box: polyBox(pts), isRect: Array.isArray(a) };
+  if (Array.isArray(a) && a.length >= 6) { out.ax = a[4]; out.ay = a[5]; }
+  return out;
+}
+
 function buildLevel(i) {
   const L = LEVELS[i];
-  const rect = a => ({ x: a[0], y: a[1], w: a[2], h: a[3] });
+  const shape = L.shape.map(p => [p[0], p[1]]);
+  const walls = (L.walls || []).map(a => ({ x: a[0], y: a[1], w: a[2], h: a[3] }));
   const lvl = {
     index: i, par: L.par, name: L.name,
+    shape, box: polyBox(shape),
     hole: { x: L.hole[0], y: L.hole[1] },
     start: { x: L.start[0], y: L.start[1] },
-    // The four border walls are flagged so the renderer can draw them as one
-    // continuous frame instead of four overlapping blocks.
-    walls: [
-      { x: 0, y: 0, w: W, h: WALL, border: true },                 // top
-      { x: 0, y: H - WALL, w: W, h: WALL, border: true },          // bottom
-      { x: 0, y: 0, w: WALL, h: H, border: true },                 // left
-      { x: W - WALL, y: 0, w: WALL, h: H, border: true }           // right
-    ].concat((L.walls || []).map(rect)),
-    sand: (L.sand || []).map(rect),
-    water: (L.water || []).map(rect),
-    boost: (L.boost || []).map(a => ({ x: a[0], y: a[1], w: a[2], h: a[3], ax: a[4], ay: a[5] })),
-    bumpers: (L.bumpers || []).map(a => ({ x: a[0], y: a[1], r: a[2] })),
+    walls,
+    sand: (L.sand || []).map(toArea),
+    water: (L.water || []).map(toArea),
+    boost: (L.boost || []).map(toArea),
+    bumpers: (L.bumpers || []).map(a => ({ x: a[0], y: a[1], r: a[2], flash: 0 })),
     movers: (L.movers || []).map(a => ({
       bx: a[0], by: a[1], w: a[2], h: a[3], tx: a[4], ty: a[5],
       period: a[6], phase: a[7] || 0, x: a[0], y: a[1], vx: 0, vy: 0
     })),
-    decor: []
+    spinners: (L.spinners || []).map(a => ({ x: a[0], y: a[1], len: a[2], w: a[3], a0: a[4] || 0, ang: a[4] || 0 })),
+    decor: [], trees: []
   };
+  // Every static edge the ball can touch: the outline plus each block's sides.
+  lvl.outline = polySegs(shape);
+  lvl.segs = lvl.outline.slice();
+  for (const w of walls) lvl.segs.push(...polySegs(rectPts(w.x, w.y, w.w, w.h)));
   makeDecor(lvl, i);
   updateMovers(lvl, 0);
   return lvl;
 }
 
-/** Flowers / rocks scattered on open grass — purely cosmetic, never collide. */
+/** Is a point blocked by anything solid or hazardous? Used for decoration. */
+function blockedForDecor(lvl, x, y, pad) {
+  if (!pointInPoly(x, y, lvl.shape) || distToSegs(x, y, lvl.segs) < pad) return true;
+  for (const A of lvl.sand.concat(lvl.water, lvl.boost)) {
+    const b = A.box;
+    if (x > b.x0 - pad && x < b.x1 + pad && y > b.y0 - pad && y < b.y1 + pad) return true;
+  }
+  for (const b of lvl.bumpers) if (Math.hypot(x - b.x, y - b.y) < b.r + pad) return true;
+  for (const m of lvl.movers) {
+    const x0 = Math.min(m.bx, m.bx + m.tx), y0 = Math.min(m.by, m.by + m.ty);
+    if (x > x0 - pad && x < x0 + m.w + Math.abs(m.tx) + pad &&
+        y > y0 - pad && y < y0 + m.h + Math.abs(m.ty) + pad) return true;
+  }
+  for (const s of lvl.spinners) if (Math.hypot(x - s.x, y - s.y) < s.len + pad) return true;
+  if (Math.hypot(x - lvl.hole.x, y - lvl.hole.y) < 46) return true;
+  if (Math.hypot(x - lvl.start.x, y - lvl.start.y) < 40) return true;
+  return false;
+}
+
+/** Flowers on the grass, trees and rocks in the rough around the course. */
 function makeDecor(lvl, seed) {
   const rnd = mulberry32(seed * 9871 + 12345);
-  const blocked = (x, y, pad) => {
-    for (const r of lvl.walls) if (rectHit(x, y, pad, r)) return true;
-    for (const r of lvl.sand) if (rectHit(x, y, pad, r)) return true;
-    for (const r of lvl.water) if (rectHit(x, y, pad, r)) return true;
-    for (const r of lvl.boost) if (rectHit(x, y, pad, r)) return true;
-    for (const b of lvl.bumpers) if (Math.hypot(x - b.x, y - b.y) < b.r + pad) return true;
-    for (const m of lvl.movers) if (rectHit(x, y, pad, { x: m.bx, y: m.by, w: m.w + Math.abs(m.tx), h: m.h + Math.abs(m.ty) })) return true;
-    if (Math.hypot(x - lvl.hole.x, y - lvl.hole.y) < 46) return true;
-    if (Math.hypot(x - lvl.start.x, y - lvl.start.y) < 46) return true;
-    return false;
-  };
+  const B = lvl.box;
+  // flowers / pebbles / clover on open grass — purely cosmetic
+  const want = Math.round(B.w * B.h / 9000);
   let tries = 0;
-  while (lvl.decor.length < 16 && tries++ < 400) {
-    const x = 20 + rnd() * (W - 40), y = 20 + rnd() * (H - 40);
-    if (blocked(x, y, 14)) continue;
+  while (lvl.decor.length < want && tries++ < want * 30) {
+    const x = B.x0 + rnd() * B.w, y = B.y0 + rnd() * B.h;
+    if (blockedForDecor(lvl, x, y, 14)) continue;
     let near = false;
     for (const d of lvl.decor) if (Math.hypot(d.x - x, d.y - y) < 34) { near = true; break; }
     if (near) continue;
     const t = rnd();
     lvl.decor.push({
-      x, y,
-      type: t < 0.6 ? "flower" : (t < 0.85 ? "rock" : "clover"),
+      x, y, type: t < 0.6 ? "flower" : (t < 0.85 ? "rock" : "clover"),
       hue: rnd(), size: 0.8 + rnd() * 0.5, rot: rnd() * TAU
     });
   }
+  // trees and boulders outside the rails (including the notches of L/U/Z shapes)
+  const ox0 = B.x0 - PAD, oy0 = B.y0 - PAD, ow = B.w + PAD * 2, oh = B.h + PAD * 2;
+  const wantT = Math.round(ow * oh / 6500);
+  tries = 0;
+  while (lvl.trees.length < wantT && tries++ < wantT * 40) {
+    const r = 13 + rnd() * 15, m = r * 1.5;
+    const x = ox0 + m + rnd() * (ow - m * 2), y = oy0 + m + rnd() * (oh - m * 2);
+    if (pointInPoly(x, y, lvl.shape)) continue;
+    if (distToSegs(x, y, lvl.outline) < RAIL + r * 0.75 + 4) continue;
+    let near = false;
+    for (const t of lvl.trees) if (Math.hypot(t.x - x, t.y - y) < (t.r + r) * 0.8) { near = true; break; }
+    if (near) continue;
+    lvl.trees.push({ x, y, r, kind: rnd() < 0.8 ? "tree" : "boulder", tone: rnd() });
+  }
+  lvl.trees.sort((a, b) => a.y - b.y);   // paint back to front
 }
 
 /* ============================ PHYSICS =====================================
-   Simple, predictable and cheap: circle vs axis-aligned rectangles, circle vs
-   circle for bumpers, exponential rolling friction, sub-stepped so a fast ball
-   can never tunnel through a wall.
+   Simple, predictable and cheap: circle vs line segments for every rail and
+   block edge, circle vs rectangle for sliders, circle vs circle for bumpers,
+   circle vs rotating bar for windmills. Exponential rolling friction, and
+   sub-stepping so the ball moves less than half its radius per step — it can
+   never cross a segment, so it can never tunnel through a wall.
    ========================================================================== */
 
 /** Moving obstacles ride a smooth cosine path so they ease at both ends. */
@@ -745,21 +932,45 @@ function updateMovers(lvl, t) {
     m.vx = m.tx * ds;
     m.vy = m.ty * ds;
   }
+  for (const s of lvl.spinners) s.ang = s.a0 + s.w * t;
 }
 
-/** Resolve ball against one rectangle. Returns impact speed, or 0 for no hit. */
+/** Resolve the ball against one static edge. Returns impact speed or 0. */
+function collideSeg(b, s, restitution) {
+  if (b.x < s.minx - BALL_R || b.x > s.maxx + BALL_R ||
+      b.y < s.miny - BALL_R || b.y > s.maxy + BALL_R) return 0;
+  let t = ((b.x - s.ax) * s.dx + (b.y - s.ay) * s.dy) / s.len2;
+  t = t < 0 ? 0 : (t > 1 ? 1 : t);
+  let nx = b.x - (s.ax + s.dx * t), ny = b.y - (s.ay + s.dy * t);
+  const d2 = nx * nx + ny * ny;
+  if (d2 >= BALL_R * BALL_R || d2 < 1e-12) return 0;
+  const d = Math.sqrt(d2);
+  nx /= d; ny /= d;
+  b.x += nx * (BALL_R - d + 0.01);
+  b.y += ny * (BALL_R - d + 0.01);
+  const vn = b.vx * nx + b.vy * ny;
+  if (vn < 0) {
+    const j = -(1 + restitution) * vn;
+    b.vx += nx * j; b.vy += ny * j;
+    // a touch of tangential drag so grazing hits bleed a little speed
+    b.vx *= 0.995; b.vy *= 0.995;
+    return -vn;
+  }
+  return 0;
+}
+
+/** Resolve ball against a sliding block (moving rectangle). */
 function collideRect(b, R, restitution, carryVX, carryVY) {
   const cx = clamp(b.x, R.x, R.x + R.w);
   const cy = clamp(b.y, R.y, R.y + R.h);
-  let dx = b.x - cx, dy = b.y - cy;
-  let d2 = dx * dx + dy * dy;
+  const dx = b.x - cx, dy = b.y - cy;
+  const d2 = dx * dx + dy * dy;
   if (d2 > BALL_R * BALL_R) return 0;
-
   let nx, ny, d;
   if (d2 > 0.000001) {
     d = Math.sqrt(d2); nx = dx / d; ny = dy / d;
   } else {
-    // Ball centre is inside the rect — push out along the shallowest face.
+    // centre inside the block — push out through the shallowest face
     const l = b.x - R.x, r = R.x + R.w - b.x, t = b.y - R.y, bo = R.y + R.h - b.y;
     const m = Math.min(l, r, t, bo);
     if (m === l) { nx = -1; ny = 0; } else if (m === r) { nx = 1; ny = 0; }
@@ -768,15 +979,11 @@ function collideRect(b, R, restitution, carryVX, carryVY) {
   }
   b.x += nx * (BALL_R - d + 0.02);
   b.y += ny * (BALL_R - d + 0.02);
-
-  // Reflect the relative velocity along the surface normal.
   const rvx = b.vx - (carryVX || 0), rvy = b.vy - (carryVY || 0);
   const vn = rvx * nx + rvy * ny;
   if (vn < 0) {
     const j = -(1 + restitution) * vn;
     b.vx += nx * j; b.vy += ny * j;
-    // A touch of tangential drag so grazing hits bleed a little speed.
-    b.vx *= 0.995; b.vy *= 0.995;
     return -vn;
   }
   return 0;
@@ -786,9 +993,9 @@ function collideRect(b, R, restitution, carryVX, carryVY) {
 function collideCircle(b, C) {
   const dx = b.x - C.x, dy = b.y - C.y;
   const rr = C.r + BALL_R;
-  let d2 = dx * dx + dy * dy;
+  const d2 = dx * dx + dy * dy;
   if (d2 > rr * rr) return 0;
-  let d = Math.sqrt(d2) || 0.0001;
+  const d = Math.sqrt(d2) || 0.0001;
   const nx = dx / d, ny = dy / d;
   b.x = C.x + nx * (rr + 0.02);
   b.y = C.y + ny * (rr + 0.02);
@@ -796,20 +1003,94 @@ function collideCircle(b, C) {
   if (vn < 0) {
     const j = -(1 + BUMPER_BOUNCE) * vn;
     b.vx += nx * j; b.vy += ny * j;
-    // Guarantee a satisfying kick even off a slow roll.
-    const sp = Math.hypot(b.vx, b.vy);
+    const sp = Math.hypot(b.vx, b.vy);           // guarantee a satisfying kick
     if (sp < 150) { b.vx = nx * 150; b.vy = ny * 150; }
     return -vn;
   }
   return 0;
 }
 
+/** Resolve ball against a windmill blade: a bar spinning about its middle. */
+function collideSpinner(b, sp) {
+  const ux = Math.cos(sp.ang), uy = Math.sin(sp.ang);
+  const t = clamp((b.x - sp.x) * ux + (b.y - sp.y) * uy, -sp.len, sp.len);
+  const px = sp.x + ux * t, py = sp.y + uy * t;
+  let nx = b.x - px, ny = b.y - py;
+  const R = BALL_R + SPIN_HALF;
+  const d2 = nx * nx + ny * ny;
+  if (d2 >= R * R) return 0;
+  let d = Math.sqrt(d2);
+  if (d < 1e-6) { nx = -uy; ny = ux; d = 0; } else { nx /= d; ny /= d; }
+  b.x += nx * (R - d + 0.02);
+  b.y += ny * (R - d + 0.02);
+  // the blade's own velocity at the contact point
+  const svx = -sp.w * (py - sp.y), svy = sp.w * (px - sp.x);
+  const vn = (b.vx - svx) * nx + (b.vy - svy) * ny;
+  if (vn < 0) {
+    const j = -1.6 * vn;
+    b.vx += nx * j; b.vy += ny * j;
+    return -vn;
+  }
+  return 0;
+}
+
+/** Would a resting ball here sit in the path of a slider or windmill? */
+function inDynamicSweep(x, y) {
+  const lvl = Game.level;
+  for (const m of lvl.movers) {
+    const x0 = Math.min(m.bx, m.bx + m.tx), y0 = Math.min(m.by, m.by + m.ty);
+    if (x > x0 - BALL_R && x < x0 + m.w + Math.abs(m.tx) + BALL_R &&
+        y > y0 - BALL_R && y < y0 + m.h + Math.abs(m.ty) + BALL_R) return true;
+  }
+  for (const s of lvl.spinners) if (Math.hypot(x - s.x, y - s.y) < s.len + BALL_R + SPIN_HALF) return true;
+  return false;
+}
+
 /** Put the ball back on dry land (water hazard / safety net). */
 function respawn(penalty) {
   const g = Game;
-  g.ball.x = g.shotOrigin.x; g.ball.y = g.shotOrigin.y;
-  g.ball.vx = 0; g.ball.vy = 0; g.ball.moving = false;
+  let x = g.shotOrigin.x, y = g.shotOrigin.y;
+  // Never drop it somewhere a slider could immediately knock it back in.
+  if (inDynamicSweep(x, y)) { x = g.level.start.x; y = g.level.start.y; }
+  g.ball.x = x; g.ball.y = y;
+  g.ball.vx = 0; g.ball.vy = 0; g.ball.moving = false; g.ball.inSand = false;
+  g.trail.length = 0;
   if (penalty) { g.strokes++; syncHUD(); }
+}
+
+/** Sliders and windmills, which can hit the ball even when it is at rest. */
+function collideDynamic(b, g) {
+  const lvl = g.level;
+  let hitAny = false;
+  for (const m of lvl.movers) {
+    const ox = b.x, oy = b.y;
+    const hit = collideRect(b, m, 0.62, m.vx, m.vy);
+    if (hit > 60) { Sound.wall(clamp(hit / 700, 0, 1)); g.shake = Math.min(6, g.shake + hit / 200); }
+    if (hit > 0 || b.x !== ox || b.y !== oy) hitAny = true;
+  }
+  for (const s of lvl.spinners) {
+    const ox = b.x, oy = b.y;
+    const hit = collideSpinner(b, s);
+    if (hit > 40) { Sound.wall(clamp(hit / 600, 0, 1)); g.shake = Math.min(6, g.shake + hit / 220); }
+    if (hit > 0 || b.x !== ox || b.y !== oy) hitAny = true;
+  }
+  return hitAny;
+}
+
+/** A slider that has pinned the ball against a rail pops it out past its
+    side (the way a real ball squirts free) instead of through the rail. */
+function squeezeOut(b, m) {
+  const cx = clamp(b.x, m.x, m.x + m.w), cy = clamp(b.y, m.y, m.y + m.h);
+  if (Math.hypot(b.x - cx, b.y - cy) >= BALL_R - 0.5) return;
+  if (Math.abs(m.tx) >= Math.abs(m.ty)) {       // slides sideways: pop out above or below
+    const up = b.y < m.y + m.h / 2;
+    b.y = up ? m.y - BALL_R - 0.5 : m.y + m.h + BALL_R + 0.5;
+    b.vy = (up ? -1 : 1) * Math.max(Math.abs(b.vy), 60);
+  } else {                                       // slides up/down: pop out left or right
+    const left = b.x < m.x + m.w / 2;
+    b.x = left ? m.x - BALL_R - 0.5 : m.x + m.w + BALL_R + 0.5;
+    b.vx = (left ? -1 : 1) * Math.max(Math.abs(b.vx), 60);
+  }
 }
 
 /** One fixed physics step. */
@@ -817,17 +1098,26 @@ function stepPhysics(dt) {
   const g = Game, b = g.ball, lvl = g.level;
   g.time += dt;
   updateMovers(lvl, g.time);
+  if (b.sunk) return;
 
-  if (b.sunk || !b.moving) return;
+  if (!b.moving) {
+    // A resting ball still gets knocked by sliders and windmills.
+    if ((lvl.movers.length || lvl.spinners.length) && collideDynamic(b, g)) {
+      for (const s of lvl.segs) collideSeg(b, s, 0);
+      for (const m of lvl.movers) squeezeOut(b, m);
+      b.moving = true; g.slowTimer = 0;
+      onBallKnocked();
+    } else {
+      return;
+    }
+  }
 
   // --- surface effects -----------------------------------------------------
-  let friction = FRICTION_GRASS;
   let inSand = false;
-  for (const s of lvl.sand) if (pointIn(b.x, b.y, s)) { inSand = true; break; }
-  if (inSand) friction = FRICTION_SAND;
+  for (const s of lvl.sand) if (inArea(b.x, b.y, s)) { inSand = true; break; }
   if (inSand !== b.inSand) { if (inSand) Sound.sand(); b.inSand = inSand; }
   for (const p of lvl.boost) {
-    if (pointIn(b.x, b.y, p)) { b.vx += p.ax * dt; b.vy += p.ay * dt; }
+    if (inArea(b.x, b.y, p)) { b.vx += p.ax * dt; b.vy += p.ay * dt; }
   }
 
   // --- gentle pull towards the cup so near misses curl in ------------------
@@ -840,34 +1130,32 @@ function stepPhysics(dt) {
   }
 
   // --- friction ------------------------------------------------------------
-  const damp = Math.exp(-friction * dt);
+  const damp = Math.exp(-(inSand ? FRICTION_SAND : FRICTION_GRASS) * dt);
   b.vx *= damp; b.vy *= damp;
   let sp = Math.hypot(b.vx, b.vy);
   if (sp < STOP_SPEED * 2.6) { b.vx *= 0.955; b.vy *= 0.955; }
 
   // --- integrate in sub-steps so nothing tunnels ---------------------------
   sp = Math.hypot(b.vx, b.vy);
-  const steps = clamp(Math.ceil(sp * dt / (BALL_R * 0.45)), 1, 8);
+  const steps = clamp(Math.ceil(sp * dt / (BALL_R * 0.45)), 1, 10);
   const sdt = dt / steps;
 
   for (let i = 0; i < steps; i++) {
     b.x += b.vx * sdt;
     b.y += b.vy * sdt;
 
-    // Movers first (they can shove), then walls, so the ball can never be
-    // squeezed out of the course.
-    for (const m of lvl.movers) {
-      const hit = collideRect(b, m, 0.62, m.vx, m.vy);
-      if (hit > 60) { Sound.wall(clamp(hit / 700, 0, 1)); g.shake = Math.min(6, g.shake + hit / 200); }
-    }
-    for (const w of lvl.walls) {
-      const hit = collideRect(b, w, WALL_BOUNCE, 0, 0);
+    // Dynamic obstacles first (they can shove), static edges last, so the
+    // ball can never be squeezed out through a rail.
+    collideDynamic(b, g);
+    for (const s of lvl.segs) {
+      const hit = collideSeg(b, s, WALL_BOUNCE);
       if (hit > 120) {
         Sound.wall(clamp(hit / 800, 0, 1));
         g.shake = Math.min(7, g.shake + hit / 260);
         spawnDust(b.x, b.y, 2);
       }
     }
+    for (const m of lvl.movers) squeezeOut(b, m);
     for (const c of lvl.bumpers) {
       const hit = collideCircle(b, c);
       if (hit > 20) {
@@ -879,11 +1167,12 @@ function stepPhysics(dt) {
 
     // --- water hazard ------------------------------------------------------
     for (const wt of lvl.water) {
-      if (pointIn(b.x, b.y, wt)) {
+      if (inArea(b.x, b.y, wt)) {
         Sound.splash();
         spawnSplash(b.x, b.y);
         g.ripples.push({ x: b.x, y: b.y, t: 0 });
         g.shake = 5;
+        buzz(30);
         respawn(true);
         return;
       }
@@ -891,16 +1180,11 @@ function stepPhysics(dt) {
 
     // --- the cup -----------------------------------------------------------
     const dx = lvl.hole.x - b.x, dy = lvl.hole.y - b.y;
-    const dist = Math.hypot(dx, dy);
-    const speed = Math.hypot(b.vx, b.vy);
-    if (dist < HOLE_R * 0.95 && speed < SINK_SPEED) { sinkBall(); return; }
-
-    // Safety net: should never happen, but never leave the ball off-course.
-    if (b.x < -BALL_R || b.x > W + BALL_R || b.y < -BALL_R || b.y > H + BALL_R) {
-      respawn(false);
-      return;
-    }
+    if (Math.hypot(dx, dy) < HOLE_R * 0.95 && Math.hypot(b.vx, b.vy) < SINK_SPEED) { sinkBall(); return; }
   }
+
+  // Safety net: should never happen, but never leave the ball off the course.
+  if (!pointInPoly(b.x, b.y, lvl.shape)) { respawn(false); return; }
 
   // --- sand fizz + come to rest -------------------------------------------
   sp = Math.hypot(b.vx, b.vy);
@@ -910,8 +1194,8 @@ function stepPhysics(dt) {
     b.vx = 0; b.vy = 0; b.moving = false; g.slowTimer = 0;
     nudgeOutOfWalls();
   } else if (sp < 46) {
-    // Watchdog: if the ball crawls for too long (e.g. wedged in a corner or
-    // sitting on a boost pad it cannot escape) just park it.
+    // Watchdog: a ball crawling for too long (wedged in a corner, or on a
+    // ramp it cannot climb) is simply parked.
     g.slowTimer += dt;
     if (g.slowTimer > 2.2) { b.vx = 0; b.vy = 0; b.moving = false; g.slowTimer = 0; nudgeOutOfWalls(); }
   } else {
@@ -919,16 +1203,15 @@ function stepPhysics(dt) {
   }
 }
 
-/** Final safety pass: a parked ball must never be left overlapping geometry.
-    Two passes are enough to settle a ball resting in a corner. */
+/** A parked ball must never be left overlapping an edge or a bumper. */
 function nudgeOutOfWalls() {
   const b = Game.ball, lvl = Game.level;
   for (let pass = 0; pass < 2; pass++) {
-    for (const w of lvl.walls) collideRect(b, w, 0, 0, 0);
+    for (const s of lvl.segs) collideSeg(b, s, 0);
     for (const c of lvl.bumpers) collideCircle(b, c);
   }
-  b.x = clamp(b.x, WALL + BALL_R, W - WALL - BALL_R);
-  b.y = clamp(b.y, WALL + BALL_R, H - WALL - BALL_R);
+  b.vx = 0; b.vy = 0;
+  if (!pointInPoly(b.x, b.y, lvl.shape)) respawn(false);
 }
 
 /** Launch the ball. power is 0..1, dir is a normalised vector. */
@@ -943,9 +1226,11 @@ function shoot(dirX, dirY, power) {
   g.slowTimer = 0;
   g.shake = Math.min(5, 1.5 + power * 3.5);
   Sound.putt(power);
+  buzz(12);
   spawnPuff(b.x, b.y, dirX, dirY);
   syncHUD();
   hideCoach();
+  onShot();
 }
 
 /* ============================ PARTICLES =================================== */
@@ -1017,28 +1302,31 @@ function sinkBall() {
   g.sinkT = 0;
   g.shake = 6;
   Sound.drop();
+  buzz(25);
+  g.trail.length = 0;
   setTimeout(() => Sound.fanfare(), 180);
   spawnCelebration(g.level.hole.x, g.level.hole.y);
   setTimeout(() => { if (Game.ball.sunk) showComplete(); }, 950);
 }
 
 /* ============================ RENDERING ===================================
-   The static parts of a hole (grass, texture, sand, decorations, cup) are
-   painted once into an offscreen canvas; each frame only redraws the things
-   that actually move. That keeps mobile frame rates comfortable.
+   The static parts of a hole (trees, rails, grass, sand, blocks, flowers,
+   cup) are painted once into an offscreen canvas at the camera's follow
+   scale. Each frame blits the visible part of it and redraws only what moves.
    ========================================================================== */
 const appEl = document.getElementById("app");
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
 const staticCv = document.createElement("canvas");
 const sctx = staticCv.getContext("2d");
-// The backdrop (gradient + the course's blurred drop shadow) never changes
-// between resizes, so it is baked once instead of every frame.
+// The screen backdrop never changes between resizes, so it is baked once.
 const bgCv = document.createElement("canvas");
 const bctx = bgCv.getContext("2d");
 
-let view = { scale: 1, ox: 0, oy: 0, dpr: 1, cw: 0, ch: 0 };
+let view = { dpr: 1, cw: 0, ch: 0 };
+const area = { x: 0, y: 0, w: 1, h: 1, cx: 0, cy: 0 };  // play area between HUD and meter
 let staticDirty = true;
+let staticInfo = { x0: 0, y0: 0, w: 1, h: 1 };
 
 /** Give #app an exact pixel height. Falls back to a portrait box derived from
     the width when the viewport reports something degenerate, which is what
@@ -1048,9 +1336,9 @@ function syncAppHeight() {
   const w = Math.round((vv && vv.width) || window.innerWidth || 360);
   let h = Math.round((vv && vv.height) || window.innerHeight || 0);
   const embedded = window.top !== window.self;
-  // A frame that is sized to its content starts out collapsed, so there is no
-  // real height to read; fall back to a portrait box derived from the width.
-  // A genuinely short viewport (landscape phone) is left alone.
+  // A frame sized to its content starts out collapsed, so there is no real
+  // height to read; fall back to a portrait box. A genuinely short viewport
+  // (landscape phone) is left alone.
   if (embedded && h < 280) h = Math.min(Math.round(w * 1.55), 780);
   if (h < 1) h = 600;
   appEl.style.height = h + "px";
@@ -1062,45 +1350,24 @@ function resize() {
   const cw = Math.max(1, Math.round(box.width));
   const ch = Math.max(1, Math.round(box.height));
   const dpr = Math.min(window.devicePixelRatio || 1, 2); // cap for mobile perf
-  // Bail out when nothing actually changed — resize() writes to the DOM, and
-  // the ResizeObserver below would otherwise feed itself forever.
+  // Bail out when nothing changed — resize() writes to the DOM, and the
+  // ResizeObserver below would otherwise feed itself forever.
   if (cw === view.cw && ch === view.ch && dpr === view.dpr) return;
   canvas.width = Math.round(cw * dpr);
   canvas.height = Math.round(ch * dpr);
   canvas.style.width = cw + "px";
   canvas.style.height = ch + "px";
+  view = { dpr, cw, ch };
 
   // Leave room for the HUD at the top and the power meter at the bottom.
-  const padTop = 74, padBottom = 60, padX = 8;
-  const availW = cw - padX * 2;
-  const availH = ch - padTop - padBottom;
-  const scale = Math.max(0.2, Math.min(availW / W, availH / H));
-  view = {
-    scale, dpr, cw, ch,
-    ox: (cw - W * scale) / 2,
-    oy: padTop + (availH - H * scale) / 2
-  };
+  const padTop = ch < 520 ? 60 : 72, padBottom = ch < 520 ? 36 : 54;
+  area.x = 6; area.y = padTop;
+  area.w = Math.max(1, cw - 12); area.h = Math.max(1, ch - padTop - padBottom);
+  area.cx = area.x + area.w / 2; area.cy = area.y + area.h / 2;
 
-  staticCv.width = Math.max(1, Math.round(W * scale * dpr));
-  staticCv.height = Math.max(1, Math.round(H * scale * dpr));
   drawBackdrop();
   staticDirty = true;
-}
-
-function drawBackdrop() {
-  const { scale, dpr, cw, ch, ox, oy } = view;
-  bgCv.width = canvas.width; bgCv.height = canvas.height;
-  bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const bg = bctx.createRadialGradient(cw / 2, ch * 0.18, 20, cw / 2, ch * 0.6, Math.max(cw, ch));
-  bg.addColorStop(0, "#1d5a37"); bg.addColorStop(0.55, "#123a24"); bg.addColorStop(1, "#081f14");
-  bctx.fillStyle = bg;
-  bctx.fillRect(0, 0, cw, ch);
-  bctx.save();
-  bctx.translate(ox, oy);
-  bctx.shadowColor = "rgba(0,0,0,.5)"; bctx.shadowBlur = 26; bctx.shadowOffsetY = 12;
-  bctx.fillStyle = "#000";
-  rr(bctx, 2, 2, W * scale - 4, H * scale - 4, 20 * scale); bctx.fill();
-  bctx.restore();
+  if (Game.level) updateCamera(0, true);
 }
 window.addEventListener("resize", resize);
 window.addEventListener("orientationchange", () => setTimeout(resize, 180));
@@ -1108,10 +1375,20 @@ if (window.visualViewport) window.visualViewport.addEventListener("resize", resi
 // An embedded host can resize the frame without firing a window resize event.
 if (window.ResizeObserver) new ResizeObserver(() => resize()).observe(document.documentElement);
 
-/* -------- rounded rectangle path (works on every browser) ---------------- */
-function rr(c, x, y, w, h, r, keepPath) {
+function drawBackdrop() {
+  const { dpr, cw, ch } = view;
+  bgCv.width = canvas.width; bgCv.height = canvas.height;
+  bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const bg = bctx.createRadialGradient(cw / 2, ch * 0.18, 20, cw / 2, ch * 0.6, Math.max(cw, ch));
+  bg.addColorStop(0, "#215f3a"); bg.addColorStop(0.55, "#143e27"); bg.addColorStop(1, "#0a2216");
+  bctx.fillStyle = bg;
+  bctx.fillRect(0, 0, cw, ch);
+}
+
+/* -------- path helpers ---------------------------------------------------- */
+function rr(c, x, y, w, h, r) {
   r = Math.min(r, w / 2, h / 2);
-  if (!keepPath) c.beginPath();   // keepPath lets us build multi-ring paths
+  c.beginPath();
   c.moveTo(x + r, y);
   c.arcTo(x + w, y, x + w, y + h, r);
   c.arcTo(x + w, y + h, x, y + h, r);
@@ -1119,213 +1396,291 @@ function rr(c, x, y, w, h, r, keepPath) {
   c.arcTo(x, y, x + w, y, r);
   c.closePath();
 }
+function polyPath(c, pts) {
+  c.beginPath();
+  c.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
+  c.closePath();
+}
+/** Polygon with softened corners; each radius is clamped to its edges so
+    dense curves (many short edges) never loop back on themselves. */
+function roundPolyPath(c, pts, r) {
+  const n = pts.length;
+  const mid = i => { const a = pts[i % n], b = pts[(i + 1) % n]; return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]; };
+  const len = i => { const a = pts[i % n], b = pts[(i + 1) % n]; return Math.hypot(b[0] - a[0], b[1] - a[1]); };
+  c.beginPath();
+  const m0 = mid(n - 1);
+  c.moveTo(m0[0], m0[1]);
+  for (let i = 0; i < n; i++) {
+    const p = pts[i], m = mid(i);
+    const ri = Math.min(r, len(i) / 2, len(i + n - 1) / 2);
+    c.arcTo(p[0], p[1], m[0], m[1], ri);
+  }
+  c.closePath();
+}
 
-/* -------- static layer: grass, texture, sand, boosts, decor, cup --------- */
+/* -------- static layer --------------------------------------------------- */
 function drawStatic() {
-  const lvl = Game.level;
-  const s = view.scale * view.dpr;
-  sctx.setTransform(s, 0, 0, s, 0, 0);
-  sctx.clearRect(0, 0, W, H);
-
-  // Base grass
-  const g = sctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0, "#6fce78");
-  g.addColorStop(0.5, "#59bf68");
-  g.addColorStop(1, "#49ab5b");
-  rr(sctx, 0, 0, W, H, 20);
-  sctx.fillStyle = g; sctx.fill();
-  sctx.save();
-  rr(sctx, 0, 0, W, H, 20); sctx.clip();
-
-  // Mown stripes
-  for (let x = 0; x < W; x += 34) {
-    sctx.fillStyle = ((x / 34) | 0) % 2 ? "rgba(255,255,255,.055)" : "rgba(0,60,20,.05)";
-    sctx.fillRect(x, 0, 34, H);
-  }
-  // Grass speckle texture
+  const lvl = Game.level, B = lvl.box;
+  const x0 = B.x0 - PAD, y0 = B.y0 - PAD, w = B.w + PAD * 2, h = B.h + PAD * 2;
+  // Bake at the follow scale, capped so the bitmap stays small on big screens.
+  let s = followScale(lvl) * view.dpr;
+  s = Math.max(0.2, Math.min(s, Math.sqrt(6e6 / (w * h))));
+  staticCv.width = Math.max(1, Math.ceil(w * s));
+  staticCv.height = Math.max(1, Math.ceil(h * s));
+  staticInfo = { x0, y0, w: staticCv.width / s, h: staticCv.height / s };
+  const c = sctx;
+  c.setTransform(s, 0, 0, s, -x0 * s, -y0 * s);
+  c.clearRect(x0, y0, w, h);
   const rnd = mulberry32(lvl.index * 4177 + 7);
-  sctx.globalAlpha = 0.12;
-  for (let i = 0; i < 420; i++) {
-    const x = rnd() * W, y = rnd() * H;
-    sctx.fillStyle = rnd() > 0.5 ? "#ffffff" : "#1f6b32";
-    sctx.fillRect(x, y, 1.5, rnd() > 0.6 ? 3 : 1.5);
-  }
-  sctx.globalAlpha = 1;
 
-  // Sand traps
+  // 1. trees and boulders in the rough
+  for (const t of lvl.trees) drawTree(c, t);
+
+  // 2. the course's soft drop shadow (rails included)
+  c.save();
+  c.shadowColor = "rgba(0,0,0,.45)"; c.shadowBlur = 22 * s; c.shadowOffsetY = 10 * s;
+  polyPath(c, lvl.shape);
+  c.fillStyle = "#000"; c.fill();
+  c.lineJoin = "round"; c.lineWidth = RAIL * 2; c.strokeStyle = "#000"; c.stroke();
+  c.restore();
+
+  // 3. wooden rails: a thick stroke whose inner half the grass then covers
+  c.lineJoin = "round";
+  polyPath(c, lvl.shape);
+  c.lineWidth = RAIL * 2 + 3; c.strokeStyle = "#6e4320"; c.stroke();
+  const wood = c.createLinearGradient(0, B.y0, 0, B.y1);
+  wood.addColorStop(0, "#e6b577"); wood.addColorStop(1, "#c08745");
+  c.lineWidth = RAIL * 2 - 1; c.strokeStyle = wood; c.stroke();
+  c.lineWidth = RAIL * 2 - 9; c.strokeStyle = "rgba(255,236,200,.28)"; c.stroke();
+
+  // 4. turf, clipped to the outline
+  c.save();
+  polyPath(c, lvl.shape); c.clip();
+  const g = c.createLinearGradient(0, B.y0, 0, B.y1);
+  g.addColorStop(0, "#71d07a"); g.addColorStop(0.5, "#5bc06a"); g.addColorStop(1, "#4aac5c");
+  c.fillStyle = g; c.fillRect(B.x0, B.y0, B.w, B.h);
+  for (let x = Math.floor(B.x0 / 34) * 34; x < B.x1; x += 34) {
+    c.fillStyle = (Math.round(x / 34) & 1) ? "rgba(255,255,255,.055)" : "rgba(0,60,20,.05)";
+    c.fillRect(x, B.y0, 34, B.h);
+  }
+  c.globalAlpha = 0.12;
+  const specks = Math.round(B.w * B.h / 520);
+  for (let i = 0; i < specks; i++) {
+    c.fillStyle = rnd() > 0.5 ? "#ffffff" : "#1f6b32";
+    c.fillRect(B.x0 + rnd() * B.w, B.y0 + rnd() * B.h, 1.5, rnd() > 0.6 ? 3 : 1.5);
+  }
+  c.globalAlpha = 1;
+
+  // 5. sand traps
   for (const sd of lvl.sand) {
-    rr(sctx, sd.x, sd.y, sd.w, sd.h, 26);
-    const sg = sctx.createLinearGradient(sd.x, sd.y, sd.x, sd.y + sd.h);
+    const b = sd.box;
+    roundPolyPath(c, sd.pts, 24);
+    const sg = c.createLinearGradient(0, b.y0, 0, b.y1);
     sg.addColorStop(0, "#f4dfa8"); sg.addColorStop(1, "#e2c583");
-    sctx.fillStyle = sg; sctx.fill();
-    sctx.strokeStyle = "rgba(120,90,40,.20)"; sctx.lineWidth = 2; sctx.stroke();
-    sctx.save(); sctx.clip();
-    sctx.globalAlpha = 0.35;
-    for (let i = 0; i < 130; i++) {
-      const x = sd.x + rnd() * sd.w, y = sd.y + rnd() * sd.h;
-      sctx.fillStyle = rnd() > 0.5 ? "#c8a86a" : "#fff3d4";
-      sctx.fillRect(x, y, 1.6, 1.6);
+    c.fillStyle = sg; c.fill();
+    c.strokeStyle = "rgba(120,90,40,.22)"; c.lineWidth = 2; c.stroke();
+    c.save(); c.clip();
+    c.globalAlpha = 0.35;
+    for (let i = 0; i < b.w * b.h / 120; i++) {
+      c.fillStyle = rnd() > 0.5 ? "#c8a86a" : "#fff3d4";
+      c.fillRect(b.x0 + rnd() * b.w, b.y0 + rnd() * b.h, 1.6, 1.6);
     }
-    sctx.restore(); sctx.globalAlpha = 1;
+    c.restore();
   }
 
-  // Decorations (flowers, rocks, clover)
-  for (const d of lvl.decor) {
-    sctx.save();
-    sctx.translate(d.x, d.y); sctx.rotate(d.rot); sctx.scale(d.size, d.size);
-    // soft shadow
-    sctx.fillStyle = "rgba(0,50,20,.16)";
-    sctx.beginPath(); sctx.ellipse(0.8, 2.4, 5, 3, 0, 0, TAU); sctx.fill();
-    if (d.type === "flower") {
-      const hue = d.hue < .33 ? "#ff8fb0" : d.hue < .66 ? "#ffd76a" : "#c39cff";
-      sctx.fillStyle = hue;
-      for (let i = 0; i < 5; i++) {
-        const a = i / 5 * TAU;
-        sctx.beginPath(); sctx.ellipse(Math.cos(a) * 2.6, Math.sin(a) * 2.6, 2, 2, 0, 0, TAU); sctx.fill();
-      }
-      sctx.fillStyle = "#fff6c9";
-      sctx.beginPath(); sctx.arc(0, 0, 1.7, 0, TAU); sctx.fill();
-    } else if (d.type === "rock") {
-      sctx.fillStyle = "#9aa7a0";
-      sctx.beginPath(); sctx.ellipse(0, 0, 5, 3.8, 0, 0, TAU); sctx.fill();
-      sctx.fillStyle = "rgba(255,255,255,.35)";
-      sctx.beginPath(); sctx.ellipse(-1.2, -1.2, 2.4, 1.6, 0, 0, TAU); sctx.fill();
-    } else {
-      sctx.fillStyle = "#3f9c4f";
-      for (let i = 0; i < 3; i++) {
-        const a = i / 3 * TAU;
-        sctx.beginPath(); sctx.ellipse(Math.cos(a) * 2.4, Math.sin(a) * 2.4, 2.6, 2.2, a, 0, TAU); sctx.fill();
-      }
-    }
-    sctx.restore();
-  }
+  // 6. flowers, pebbles, clover
+  for (const d of lvl.decor) drawDecor(c, d);
 
-  // The cup
+  // 7. soft shade along the inside of the rails
+  polyPath(c, lvl.shape);
+  c.lineWidth = 9; c.strokeStyle = "rgba(0,45,20,.16)"; c.stroke();
+  c.restore();
+
+  // 8. interior wooden blocks
+  for (const wb of lvl.walls) drawWoodBlock(c, wb.x, wb.y, wb.w, wb.h);
+
+  // 9. the cup
   const hx = lvl.hole.x, hy = lvl.hole.y;
-  sctx.fillStyle = "rgba(0,50,22,.22)";
-  sctx.beginPath(); sctx.ellipse(hx, hy + 2, HOLE_R + 4, HOLE_R + 3, 0, 0, TAU); sctx.fill();
-  const hg = sctx.createRadialGradient(hx, hy - 3, 1, hx, hy, HOLE_R);
+  c.fillStyle = "rgba(0,50,22,.22)";
+  c.beginPath(); c.ellipse(hx, hy + 2, HOLE_R + 4, HOLE_R + 3, 0, 0, TAU); c.fill();
+  const hg = c.createRadialGradient(hx, hy - 3, 1, hx, hy, HOLE_R);
   hg.addColorStop(0, "#000000"); hg.addColorStop(0.65, "#08150d"); hg.addColorStop(1, "#14301d");
-  sctx.beginPath(); sctx.arc(hx, hy, HOLE_R, 0, TAU); sctx.fillStyle = hg; sctx.fill();
-  sctx.strokeStyle = "rgba(255,255,255,.30)"; sctx.lineWidth = 1.6;
-  sctx.beginPath(); sctx.arc(hx, hy, HOLE_R - 0.6, Math.PI * 0.15, Math.PI * 0.9); sctx.stroke();
+  c.beginPath(); c.arc(hx, hy, HOLE_R, 0, TAU); c.fillStyle = hg; c.fill();
+  c.strokeStyle = "rgba(255,255,255,.30)"; c.lineWidth = 1.6;
+  c.beginPath(); c.arc(hx, hy, HOLE_R - 0.6, Math.PI * 0.15, Math.PI * 0.9); c.stroke();
 
-  sctx.restore();
   staticDirty = false;
 }
 
-/* -------- dynamic frame -------------------------------------------------- */
-function render(t) {
-  const lvl = Game.level;
-  const { scale, dpr, ox, oy } = view;
+function drawTree(c, t) {
+  if (t.kind === "boulder") {
+    c.fillStyle = "rgba(0,0,0,.25)";
+    c.beginPath(); c.ellipse(t.x + 4, t.y + 6, t.r * 0.8, t.r * 0.55, 0, 0, TAU); c.fill();
+    const g = c.createRadialGradient(t.x - t.r * .3, t.y - t.r * .35, 1, t.x, t.y, t.r * 0.8);
+    g.addColorStop(0, "#c9d1cb"); g.addColorStop(1, "#7d8a83");
+    c.fillStyle = g;
+    c.beginPath(); c.ellipse(t.x, t.y, t.r * 0.8, t.r * 0.62, 0.3, 0, TAU); c.fill();
+    return;
+  }
+  // soft shadow, then a cluster of canopy blobs, then a highlight
+  c.fillStyle = "rgba(0,0,0,.28)";
+  c.beginPath(); c.ellipse(t.x + t.r * 0.35, t.y + t.r * 0.45, t.r * 1.05, t.r * 0.85, 0, 0, TAU); c.fill();
+  const dark = t.tone < 0.5 ? "#1f6d3a" : "#256f2f", mid = t.tone < 0.5 ? "#2f8a4a" : "#3a8f3c";
+  c.fillStyle = dark;
+  c.beginPath(); c.arc(t.x, t.y, t.r, 0, TAU); c.fill();
+  c.fillStyle = mid;
+  for (let i = 0; i < 4; i++) {
+    const a = i / 4 * TAU + t.tone * 3;
+    c.beginPath(); c.arc(t.x + Math.cos(a) * t.r * 0.42, t.y + Math.sin(a) * t.r * 0.42, t.r * 0.55, 0, TAU); c.fill();
+  }
+  c.fillStyle = "rgba(190,255,170,.22)";
+  c.beginPath(); c.arc(t.x - t.r * 0.3, t.y - t.r * 0.35, t.r * 0.45, 0, TAU); c.fill();
+}
 
-  // Backdrop + course shadow (pre-baked in drawBackdrop)
+function drawDecor(c, d) {
+  c.save();
+  c.translate(d.x, d.y); c.rotate(d.rot); c.scale(d.size, d.size);
+  c.fillStyle = "rgba(0,50,20,.16)";
+  c.beginPath(); c.ellipse(0.8, 2.4, 5, 3, 0, 0, TAU); c.fill();
+  if (d.type === "flower") {
+    c.fillStyle = d.hue < .33 ? "#ff8fb0" : d.hue < .66 ? "#ffd76a" : "#c39cff";
+    for (let i = 0; i < 5; i++) {
+      const a = i / 5 * TAU;
+      c.beginPath(); c.ellipse(Math.cos(a) * 2.6, Math.sin(a) * 2.6, 2, 2, 0, 0, TAU); c.fill();
+    }
+    c.fillStyle = "#fff6c9";
+    c.beginPath(); c.arc(0, 0, 1.7, 0, TAU); c.fill();
+  } else if (d.type === "rock") {
+    c.fillStyle = "#9aa7a0";
+    c.beginPath(); c.ellipse(0, 0, 5, 3.8, 0, 0, TAU); c.fill();
+    c.fillStyle = "rgba(255,255,255,.35)";
+    c.beginPath(); c.ellipse(-1.2, -1.2, 2.4, 1.6, 0, 0, TAU); c.fill();
+  } else {
+    c.fillStyle = "#3f9c4f";
+    for (let i = 0; i < 3; i++) {
+      const a = i / 3 * TAU;
+      c.beginPath(); c.ellipse(Math.cos(a) * 2.4, Math.sin(a) * 2.4, 2.6, 2.2, a, 0, TAU); c.fill();
+    }
+  }
+  c.restore();
+}
+
+function drawWoodBlock(c, x, y, w, h) {
+  c.fillStyle = "rgba(0,40,18,.32)";
+  rr(c, x + 1.5, y + 4.5, w, h, 6); c.fill();
+  const g = c.createLinearGradient(x, y, x, y + h);
+  g.addColorStop(0, "#e6b577"); g.addColorStop(0.55, "#e0ab6d"); g.addColorStop(1, "#a9702f");
+  rr(c, x, y, w, h, 6); c.fillStyle = g; c.fill();
+  c.strokeStyle = "rgba(60,32,8,.4)"; c.lineWidth = 1.6; c.stroke();
+  c.strokeStyle = "rgba(255,255,255,.34)"; c.lineWidth = 1.4;
+  rr(c, x + 1.6, y + 1.6, w - 3.2, h - 3.2, 4.5); c.stroke();
+}
+
+/* -------- per-frame ------------------------------------------------------ */
+function render(t) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.drawImage(bgCv, 0, 0);
-
+  const lvl = Game.level;
   if (!lvl) return;
   if (staticDirty) drawStatic();
 
-  // Camera shake
-  let sx = 0, sy = 0;
+  let sx = 0, sy = 0;   // camera shake
   if (Game.shake > 0.05) {
     sx = (Math.random() - 0.5) * Game.shake;
     sy = (Math.random() - 0.5) * Game.shake;
   }
+  const dpr = view.dpr, k = Cam.scale;
+  ctx.setTransform(k * dpr, 0, 0, k * dpr,
+                   (area.cx + sx - Cam.x * k) * dpr, (area.cy + sy - Cam.y * k) * dpr);
 
-  // Everything below is drawn in world units.
-  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, (ox + sx) * dpr, (oy + sy) * dpr);
+  // 1. the baked course
+  ctx.drawImage(staticCv, staticInfo.x0, staticInfo.y0, staticInfo.w, staticInfo.h);
 
-  // 1. static layer
-  ctx.drawImage(staticCv, 0, 0, W, H);
-
-  ctx.save();
-  rr(ctx, 0, 0, W, H, 20); ctx.clip();
-
-  // 2. water (animated)
-  for (const wt of lvl.water) drawWater(wt, t);
-  for (const rp of Game.ripples) {
-    const p = rp.t / 1.1;
-    ctx.strokeStyle = "rgba(255,255,255," + (0.5 * (1 - p)) + ")";
-    ctx.lineWidth = 2 * (1 - p) + 0.5;
-    ctx.beginPath(); ctx.arc(rp.x, rp.y, 4 + p * 26, 0, TAU); ctx.stroke();
+  // 2. water and ramps, clipped to the course
+  if (lvl.water.length || lvl.boost.length || Game.ripples.length) {
+    ctx.save();
+    polyPath(ctx, lvl.shape); ctx.clip();
+    for (const wt of lvl.water) drawWater(wt, t);
+    for (const rp of Game.ripples) {
+      const p = rp.t / 1.1;
+      ctx.strokeStyle = "rgba(255,255,255," + (0.5 * (1 - p)) + ")";
+      ctx.lineWidth = 2 * (1 - p) + 0.5;
+      ctx.beginPath(); ctx.arc(rp.x, rp.y, 4 + p * 26, 0, TAU); ctx.stroke();
+    }
+    for (const p of lvl.boost) drawBoost(p, t);
+    ctx.restore();
   }
 
-  // 3. boost pads (ramps)
-  for (const p of lvl.boost) drawBoost(p, t);
-
-  // 4. bumpers
+  // 3. bumpers, sliders, windmills
   for (const c of lvl.bumpers) drawBumper(c);
+  for (const m of lvl.movers) drawSlider(m);
+  for (const s of lvl.spinners) drawSpinner(s);
 
-  // 5. moving obstacles
-  for (const m of lvl.movers) drawBlock(m, "#c05a4a", "#e5776a");
-
-  // 6. ball shadow + aim preview + ball
-  if (!Game.ball.sunk || Game.sinkT < 0.45) drawBall();
+  // 4. ball trail, aim, ball
+  drawTrail();
   if (Game.aiming && !Game.ball.moving && !Game.ball.sunk) drawAim();
+  if (!Game.ball.sunk || Game.sinkT < 0.45) drawBall();
 
-  // 7. walls last so the ball tucks under their edges
-  drawBorder();
-  for (const w of lvl.walls) if (!w.border) drawBlock(w, "#a9702f", "#e0ab6d");
-
-  // 8. particles + flag
+  // 5. particles + flag
   drawParticles();
   drawFlag(lvl.hole.x, lvl.hole.y, t);
 
-  ctx.restore();
-
-  // Hole intro flash
+  // 6. screen-space overlays
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawFlagPointer();
   if (Game.transition < 1) {
-    ctx.fillStyle = "rgba(6,26,16," + (1 - Game.transition) + ")";
-    rr(ctx, 0, 0, W, H, 20); ctx.fill();
+    ctx.fillStyle = "rgba(8,30,19," + (1 - Game.transition) + ")";
+    ctx.fillRect(0, 0, view.cw, view.ch);
   }
 }
 
 function drawWater(wt, t) {
-  rr(ctx, wt.x, wt.y, wt.w, wt.h, 18);
-  const g = ctx.createLinearGradient(wt.x, wt.y, wt.x, wt.y + wt.h);
+  const b = wt.box;
+  roundPolyPath(ctx, wt.pts, 18);
+  const g = ctx.createLinearGradient(0, b.y0, 0, b.y1);
   g.addColorStop(0, "#3aa9d8"); g.addColorStop(0.6, "#2b86c4"); g.addColorStop(1, "#2270ae");
   ctx.fillStyle = g; ctx.fill();
   ctx.save(); ctx.clip();
-  // rolling highlight bands
   ctx.strokeStyle = "rgba(255,255,255,.22)"; ctx.lineWidth = 2;
-  for (let i = 0; i < 5; i++) {
-    const yy = wt.y + ((i * 22 + t * 14) % (wt.h + 22)) - 11;
+  const bands = Math.max(3, Math.round(b.h / 22));
+  for (let i = 0; i < bands; i++) {
+    const yy = b.y0 + ((i * 22 + t * 14) % (b.h + 22)) - 11;
     ctx.beginPath();
-    for (let x = wt.x; x <= wt.x + wt.w; x += 8) {
+    for (let x = b.x0; x <= b.x1 + 8; x += 8) {
       const yv = yy + Math.sin((x * 0.06) + t * 1.8 + i) * 2.4;
-      if (x === wt.x) ctx.moveTo(x, yv); else ctx.lineTo(x, yv);
+      if (x === b.x0) ctx.moveTo(x, yv); else ctx.lineTo(x, yv);
     }
     ctx.stroke();
   }
-  ctx.fillStyle = "rgba(255,255,255,.10)";
-  ctx.fillRect(wt.x, wt.y, wt.w, 6);
   ctx.restore();
   ctx.strokeStyle = "rgba(10,50,80,.35)"; ctx.lineWidth = 2;
-  rr(ctx, wt.x, wt.y, wt.w, wt.h, 18); ctx.stroke();
+  roundPolyPath(ctx, wt.pts, 18); ctx.stroke();
 }
 
 function drawBoost(p, t) {
-  rr(ctx, p.x, p.y, p.w, p.h, 14);
-  const g = ctx.createLinearGradient(p.x, p.y + p.h, p.x, p.y);
+  const b = p.box;
+  roundPolyPath(ctx, p.pts, 14);
+  const g = ctx.createLinearGradient(0, b.y1, 0, b.y0);
   g.addColorStop(0, "#6fd0f0"); g.addColorStop(1, "#a8f0d0");
   ctx.fillStyle = g; ctx.fill();
   ctx.save(); ctx.clip();
   // animated chevrons pointing the way the pad pushes
-  const ang = Math.atan2(p.ay, p.ax);
-  ctx.translate(p.x + p.w / 2, p.y + p.h / 2);
-  ctx.rotate(ang + Math.PI / 2);
-  const span = Math.max(p.w, p.h);
+  ctx.translate(b.x0 + b.w / 2, b.y0 + b.h / 2);
+  ctx.rotate(Math.atan2(p.ay, p.ax) + Math.PI / 2);
+  const span = Math.max(b.w, b.h);
   ctx.strokeStyle = "rgba(255,255,255,.75)"; ctx.lineWidth = 4; ctx.lineCap = "round";
-  for (let i = -3; i <= 3; i++) {
+  const n = Math.ceil(span / 26) + 2;
+  for (let i = -n; i <= n; i++) {
     const yy = ((i * 26 + (t * 60) % 26) + span) % (span + 26) - span / 2 - 13;
     ctx.beginPath();
     ctx.moveTo(-14, yy + 9); ctx.lineTo(0, yy - 3); ctx.lineTo(14, yy + 9);
     ctx.stroke();
   }
   ctx.restore();
+  ctx.lineCap = "butt";
   ctx.strokeStyle = "rgba(255,255,255,.55)"; ctx.lineWidth = 2;
-  rr(ctx, p.x, p.y, p.w, p.h, 14); ctx.stroke();
+  roundPolyPath(ctx, p.pts, 14); ctx.stroke();
 }
 
 function drawBumper(c) {
@@ -1346,39 +1701,61 @@ function drawBumper(c) {
   }
 }
 
-function drawBlock(b, dark, light) {
+function drawSlider(m) {
   ctx.fillStyle = "rgba(0,40,18,.32)";
-  rr(ctx, b.x + 1.5, b.y + 4.5, b.w, b.h, 8); ctx.fill();
-  const g = ctx.createLinearGradient(b.x, b.y, b.x, b.y + b.h);
-  g.addColorStop(0, light); g.addColorStop(0.55, light); g.addColorStop(1, dark);
-  rr(ctx, b.x, b.y, b.w, b.h, 8); ctx.fillStyle = g; ctx.fill();
-  ctx.strokeStyle = "rgba(60,32,8,.35)"; ctx.lineWidth = 1.6;
-  rr(ctx, b.x, b.y, b.w, b.h, 8); ctx.stroke();
-  ctx.strokeStyle = "rgba(255,255,255,.34)"; ctx.lineWidth = 1.4;
-  rr(ctx, b.x + 1.6, b.y + 1.6, b.w - 3.2, b.h - 3.2, 6.5); ctx.stroke();
+  rr(ctx, m.x + 1.5, m.y + 4.5, m.w, m.h, 7); ctx.fill();
+  const g = ctx.createLinearGradient(m.x, m.y, m.x, m.y + m.h);
+  g.addColorStop(0, "#ef7f70"); g.addColorStop(1, "#bd5545");
+  rr(ctx, m.x, m.y, m.w, m.h, 7); ctx.fillStyle = g; ctx.fill();
+  // hazard stripes so a slider never reads as a static block
+  ctx.save(); ctx.clip();
+  ctx.strokeStyle = "rgba(255,255,255,.22)"; ctx.lineWidth = 6;
+  for (let x = m.x - m.h; x < m.x + m.w; x += 16) {
+    ctx.beginPath(); ctx.moveTo(x, m.y + m.h); ctx.lineTo(x + m.h, m.y); ctx.stroke();
+  }
+  ctx.restore();
+  ctx.strokeStyle = "rgba(90,20,10,.4)"; ctx.lineWidth = 1.5;
+  rr(ctx, m.x, m.y, m.w, m.h, 7); ctx.stroke();
 }
 
-function drawBorder() {
-  // Outer frame drawn as a single ring so the corners look right.
+function drawSpinner(s) {
+  const L = s.len, T = SPIN_HALF;
   ctx.save();
-  ctx.beginPath();
-  rr(ctx, 0, 0, W, H, 20, true);
-  rr(ctx, WALL, WALL, W - WALL * 2, H - WALL * 2, 10, true);
-  ctx.fillStyle = "#b8813f";
-  ctx.fill("evenodd");
-  // bevel highlight
-  ctx.clip("evenodd");
-  const g = ctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0, "rgba(255,225,175,.42)");
-  g.addColorStop(0.5, "rgba(255,255,255,.10)");
-  g.addColorStop(1, "rgba(60,30,0,.22)");
-  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-  ctx.restore();
-  // inner shadow onto the grass
+  ctx.translate(s.x, s.y);
+  // shadow
   ctx.save();
-  rr(ctx, WALL, WALL, W - WALL * 2, H - WALL * 2, 10);
-  ctx.strokeStyle = "rgba(0,45,20,.22)"; ctx.lineWidth = 5; ctx.stroke();
+  ctx.translate(2, 4); ctx.rotate(s.ang);
+  ctx.fillStyle = "rgba(0,40,18,.3)";
+  rr(ctx, -L, -T, L * 2, T * 2, T); ctx.fill();
   ctx.restore();
+  // blade: white with red tips
+  ctx.rotate(s.ang);
+  rr(ctx, -L, -T, L * 2, T * 2, T);
+  ctx.fillStyle = "#f6f1e8"; ctx.fill();
+  ctx.fillStyle = "#e5574a";
+  rr(ctx, L - 22, -T, 22, T * 2, T); ctx.fill();
+  rr(ctx, -L, -T, 22, T * 2, T); ctx.fill();
+  ctx.strokeStyle = "rgba(60,30,20,.35)"; ctx.lineWidth = 1.2;
+  rr(ctx, -L, -T, L * 2, T * 2, T); ctx.stroke();
+  // hub
+  ctx.beginPath(); ctx.arc(0, 0, 8, 0, TAU);
+  ctx.fillStyle = "#8b5a2b"; ctx.fill();
+  ctx.beginPath(); ctx.arc(0, 0, 3, 0, TAU);
+  ctx.fillStyle = "#f3d9a4"; ctx.fill();
+  ctx.restore();
+}
+
+function drawTrail() {
+  const tr = Game.trail;
+  if (tr.length < 2) return;
+  ctx.lineCap = "round";
+  for (let i = 1; i < tr.length; i++) {
+    const a = i / tr.length;
+    ctx.strokeStyle = "rgba(255,255,255," + (a * 0.32) + ")";
+    ctx.lineWidth = BALL_R * 1.3 * a;
+    ctx.beginPath(); ctx.moveTo(tr[i - 1].x, tr[i - 1].y); ctx.lineTo(tr[i].x, tr[i].y); ctx.stroke();
+  }
+  ctx.lineCap = "butt";
 }
 
 function drawBall() {
@@ -1386,10 +1763,8 @@ function drawBall() {
   const scl = b.sunk ? clamp(1 - Game.sinkT * 2.6, 0, 1) : 1;
   if (scl <= 0.02) return;
   const r = BALL_R * scl;
-  // soft shadow
   ctx.fillStyle = "rgba(0,45,20,.30)";
   ctx.beginPath(); ctx.ellipse(b.x + 2.2, b.y + 3.2, r * 1.02, r * 0.9, 0, 0, TAU); ctx.fill();
-  // ball body
   const g = ctx.createRadialGradient(b.x - r * .38, b.y - r * .45, r * .15, b.x, b.y, r);
   g.addColorStop(0, "#ffffff"); g.addColorStop(0.62, "#f2f6f2"); g.addColorStop(1, "#c3d2c8");
   ctx.beginPath(); ctx.arc(b.x, b.y, r, 0, TAU); ctx.fillStyle = g; ctx.fill();
@@ -1402,15 +1777,15 @@ function drawAim() {
   if (g.power <= 0.01) return;
   const dx = g.aimStart.x - g.aimNow.x, dy = g.aimStart.y - g.aimNow.y;
   const len = Math.hypot(dx, dy);
-  if (len < MIN_DRAG) return;
+  if (len < MIN_DRAG_PX) return;
   const nx = dx / len, ny = dy / len;
 
-  // Predicted path with up to two bounces.
-  const pts = predictPath(b.x, b.y, nx, ny, 60 + g.power * 300);
+  // predicted path with up to two bounces
+  const pts = predictPath(b.x, b.y, nx, ny, 70 + g.power * 330);
   ctx.save();
   ctx.setLineDash([7, 9]);
   ctx.lineDashOffset = -(performance.now() / 45) % 16;
-  ctx.strokeStyle = "rgba(255,255,255,.72)";
+  ctx.strokeStyle = "rgba(255,255,255,.75)";
   ctx.lineWidth = 2.6; ctx.lineCap = "round";
   ctx.beginPath();
   ctx.moveTo(pts[0].x, pts[0].y);
@@ -1418,62 +1793,58 @@ function drawAim() {
   ctx.stroke();
   ctx.restore();
 
-  // Arrow head at the end of the preview
   const last = pts[pts.length - 1], prev = pts[pts.length - 2] || pts[0];
-  const a = Math.atan2(last.y - prev.y, last.x - prev.x);
   ctx.save();
-  ctx.translate(last.x, last.y); ctx.rotate(a);
-  ctx.fillStyle = "rgba(255,255,255,.85)";
+  ctx.translate(last.x, last.y); ctx.rotate(Math.atan2(last.y - prev.y, last.x - prev.x));
+  ctx.fillStyle = "rgba(255,255,255,.88)";
   ctx.beginPath(); ctx.moveTo(8, 0); ctx.lineTo(-5, 5.5); ctx.lineTo(-5, -5.5); ctx.closePath(); ctx.fill();
   ctx.restore();
 
-  // Pull-back rubber band + power ring around the ball
-  ctx.strokeStyle = "rgba(255,255,255,.28)";
-  ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(b.x - nx * len * 0.6, b.y - ny * len * 0.6); ctx.stroke();
-  const col = g.power < 0.5 ? "#8ef0a8" : g.power < 0.8 ? "#ffe066" : "#ff7a63";
-  ctx.strokeStyle = col; ctx.lineWidth = 3.4; ctx.lineCap = "round";
+  // pull-back band + power ring around the ball
+  const band = Math.min(len, MAX_DRAG_PX) * 0.6 / Cam.scale;
+  ctx.strokeStyle = "rgba(255,255,255,.28)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(b.x - nx * band, b.y - ny * band); ctx.stroke();
+  ctx.strokeStyle = g.power < 0.5 ? "#8ef0a8" : g.power < 0.8 ? "#ffe066" : "#ff7a63";
+  ctx.lineWidth = 3.4; ctx.lineCap = "round";
   ctx.beginPath();
   ctx.arc(b.x, b.y, BALL_R + 6, -Math.PI / 2, -Math.PI / 2 + TAU * g.power);
   ctx.stroke();
   ctx.lineCap = "butt";
 }
 
-/** Cheap ray march used for the aim preview (walls + movers only). */
+/** Cheap ray march for the aim preview (rails, blocks and bumpers). */
 function predictPath(x, y, dx, dy, dist) {
   const lvl = Game.level;
   const pts = [{ x, y }];
   const step = 6;
   let bounces = 0;
-  const solids = lvl.walls.concat(lvl.movers);
   for (let travelled = 0; travelled < dist; travelled += step) {
     x += dx * step; y += dy * step;
-    let hitNormal = null;
-    for (const r of solids) {
-      const cx = clamp(x, r.x, r.x + r.w), cy = clamp(y, r.y, r.y + r.h);
-      const ddx = x - cx, ddy = y - cy;
-      const d = Math.hypot(ddx, ddy);
+    let hit = null;
+    for (const s of lvl.segs) {
+      if (x < s.minx - BALL_R || x > s.maxx + BALL_R || y < s.miny - BALL_R || y > s.maxy + BALL_R) continue;
+      let t = ((x - s.ax) * s.dx + (y - s.ay) * s.dy) / s.len2;
+      t = t < 0 ? 0 : (t > 1 ? 1 : t);
+      const cx = s.ax + s.dx * t, cy = s.ay + s.dy * t;
+      const d = Math.hypot(x - cx, y - cy);
       if (d < BALL_R) {
-        if (d > 0.001) hitNormal = { x: ddx / d, y: ddy / d };
-        else hitNormal = { x: -dx, y: -dy };
-        x = cx + hitNormal.x * (BALL_R + 0.5);
-        y = cy + hitNormal.y * (BALL_R + 0.5);
+        hit = d > 0.001 ? { x: (x - cx) / d, y: (y - cy) / d } : { x: -dx, y: -dy };
+        x = cx + hit.x * (BALL_R + 0.5); y = cy + hit.y * (BALL_R + 0.5);
         break;
       }
     }
-    for (const c of lvl.bumpers) {
+    if (!hit) for (const c of lvl.bumpers) {
       const ddx = x - c.x, ddy = y - c.y, d = Math.hypot(ddx, ddy);
       if (d < c.r + BALL_R) {
-        hitNormal = { x: ddx / (d || 1), y: ddy / (d || 1) };
-        x = c.x + hitNormal.x * (c.r + BALL_R + 0.5);
-        y = c.y + hitNormal.y * (c.r + BALL_R + 0.5);
+        hit = { x: ddx / (d || 1), y: ddy / (d || 1) };
+        x = c.x + hit.x * (c.r + BALL_R + 0.5); y = c.y + hit.y * (c.r + BALL_R + 0.5);
         break;
       }
     }
-    if (hitNormal) {
+    if (hit) {
       pts.push({ x, y });
-      const dot = dx * hitNormal.x + dy * hitNormal.y;
-      dx -= 2 * dot * hitNormal.x; dy -= 2 * dot * hitNormal.y;
+      const dot = dx * hit.x + dy * hit.y;
+      dx -= 2 * dot * hit.x; dy -= 2 * dot * hit.y;
       if (++bounces >= 2) break;
     }
   }
@@ -1493,13 +1864,10 @@ function drawFlag(x, y, t) {
   const sway = Math.sin(t * 2.2) * 0.06;
   const topY = y - 46;
   ctx.save();
-  // pole shadow on the grass
   ctx.strokeStyle = "rgba(0,45,20,.18)"; ctx.lineWidth = 3; ctx.lineCap = "round";
   ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 16, y + 7); ctx.stroke();
-  // pole
   ctx.strokeStyle = "#f7f7f2"; ctx.lineWidth = 2.4;
   ctx.beginPath(); ctx.moveTo(x, y - 2); ctx.lineTo(x + sway * 10, topY); ctx.stroke();
-  // flag
   ctx.fillStyle = "#ff5a52";
   ctx.beginPath();
   ctx.moveTo(x + sway * 10, topY);
@@ -1515,53 +1883,138 @@ function drawFlag(x, y, t) {
   ctx.restore();
 }
 
-/* ============================ INPUT =======================================
-   One unified pointer path handles touch, pen and mouse. The drag can start
-   anywhere on the course so your thumb never covers the ball.
-   ========================================================================== */
-function toWorld(clientX, clientY) {
-  return {
-    x: (clientX - view.ox) / view.scale,
-    y: (clientY - view.oy) / view.scale
-  };
+/** When the flag is off screen, a badge on the edge points the way to it. */
+function drawFlagPointer() {
+  const lvl = Game.level;
+  if (Game.screen !== "play" || Game.ball.sunk) return;
+  const p = toScreen(lvl.hole.x, lvl.hole.y - 20);
+  const inset = 30;
+  const x0 = area.x + inset, x1 = area.x + area.w - inset, y0 = area.y + inset, y1 = area.y + area.h - inset;
+  if (p.x > x0 && p.x < x1 && p.y > y0 && p.y < y1) return;
+  // walk from the centre toward the flag until we hit the inset rectangle
+  const dx = p.x - area.cx, dy = p.y - area.cy;
+  const sx = dx === 0 ? Infinity : ((dx > 0 ? x1 : x0) - area.cx) / dx;
+  const sy = dy === 0 ? Infinity : ((dy > 0 ? y1 : y0) - area.cy) / dy;
+  const s = Math.min(sx, sy);
+  const bx = area.cx + dx * s, by = area.cy + dy * s;
+  const ang = Math.atan2(dy, dx);
+  ctx.save();
+  ctx.translate(bx, by);
+  ctx.globalAlpha = 0.92;
+  ctx.fillStyle = "rgba(6,28,18,.72)";
+  ctx.beginPath(); ctx.arc(0, 0, 17, 0, TAU); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 1.5; ctx.stroke();
+  // pointer nub
+  ctx.save(); ctx.rotate(ang);
+  ctx.fillStyle = "#ffd76a";
+  ctx.beginPath(); ctx.moveTo(25, 0); ctx.lineTo(17, -6); ctx.lineTo(17, 6); ctx.closePath(); ctx.fill();
+  ctx.restore();
+  // tiny flag
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.8;
+  ctx.beginPath(); ctx.moveTo(-3, 8); ctx.lineTo(-3, -9); ctx.stroke();
+  ctx.fillStyle = "#ff5a52";
+  ctx.beginPath(); ctx.moveTo(-3, -9); ctx.lineTo(8, -5); ctx.lineTo(-3, -1); ctx.closePath(); ctx.fill();
+  ctx.restore();
 }
 
+/* ============================ CAMERA ======================================
+   Short holes fit on screen whole. Long holes are framed by width and
+   scroll: the camera follows the ball, leaning a little toward the flag, and
+   flies in from the flag when the hole starts. "Overview" zooms to the
+   whole course.
+   ========================================================================== */
+const Cam = { x: 200, y: 300, scale: 1, overview: false, introT: 0 };
+
+function fitBox(lvl) {
+  const m = RAIL + 14, B = lvl.box;
+  return { x0: B.x0 - m, y0: B.y0 - m, w: B.w + m * 2, h: B.h + m * 2 };
+}
+function followScale(lvl) {
+  const f = fitBox(lvl);
+  // Wide screens (landscape phones, desktops) show a shorter stretch of the
+  // course so it isn't drawn tiny.
+  const span = area.w > area.h * 1.1 ? 480 : VIEW_SPAN;
+  return Math.min(area.w / f.w, area.h / Math.min(f.h, span), 2.4);
+}
+function overviewScale(lvl) {
+  const f = fitBox(lvl);
+  return Math.min(area.w / f.w, area.h / f.h, 2.4);
+}
+function courseFits(lvl) { return overviewScale(lvl) >= followScale(lvl) - 1e-6; }
+
+function camTarget(lvl) {
+  const f = fitBox(lvl);
+  const s = Cam.overview ? overviewScale(lvl) : followScale(lvl);
+  let tx, ty;
+  if (Cam.overview) { tx = f.x0 + f.w / 2; ty = f.y0 + f.h / 2; }
+  else if (Cam.introT > 0) { tx = lvl.hole.x; ty = lvl.hole.y; }
+  else {
+    const b = Game.ball;
+    tx = b.x; ty = b.y;
+    if (!b.sunk) {   // lean a little toward the flag so you can see where you're going
+      const dx = lvl.hole.x - b.x, dy = lvl.hole.y - b.y, d = Math.hypot(dx, dy);
+      const look = Math.min(d * 0.45, area.h / s * 0.26);
+      if (d > 1) { tx += dx / d * look; ty += dy / d * look; }
+    }
+  }
+  const hw = area.w / 2 / s, hh = area.h / 2 / s;
+  tx = f.w <= hw * 2 ? f.x0 + f.w / 2 : clamp(tx, f.x0 + hw, f.x0 + f.w - hw);
+  ty = f.h <= hh * 2 ? f.y0 + f.h / 2 : clamp(ty, f.y0 + hh, f.y0 + f.h - hh);
+  return { x: tx, y: ty, s };
+}
+
+function updateCamera(dt, snap) {
+  const lvl = Game.level;
+  if (!lvl) return;
+  if (Cam.introT > 0) Cam.introT -= dt;
+  const T = camTarget(lvl);
+  if (snap) { Cam.x = T.x; Cam.y = T.y; Cam.scale = T.s; return; }
+  const k = 1 - Math.exp(-dt * (Game.ball.moving ? 5 : 3.2));
+  Cam.x += (T.x - Cam.x) * k;
+  Cam.y += (T.y - Cam.y) * k;
+  Cam.scale += (T.s - Cam.scale) * (1 - Math.exp(-dt * 6));
+}
+
+function toScreen(wx, wy) {
+  return { x: area.cx + (wx - Cam.x) * Cam.scale, y: area.cy + (wy - Cam.y) * Cam.scale };
+}
+
+/* ============================ INPUT =======================================
+   One unified pointer path handles touch, pen and mouse. The drag can start
+   anywhere so your thumb never covers the ball, and it is measured in screen
+   pixels so zoom level and a moving camera never change how a shot feels.
+   ========================================================================== */
 let activePointer = null;
 
 function inputStart(id, cx, cy) {
   Sound.init(); Sound.resume();
   if (Game.screen !== "play") return;
+  if (Cam.introT > 0) { Cam.introT = 0; return; }              // tap skips the flyover
   const b = Game.ball;
   if (b.moving || b.sunk || Game.transition < 0.35) return;   // no shooting mid-roll
   activePointer = id;
-  const p = toWorld(cx, cy);
   Game.aiming = true;
-  Game.aimStart = p;
-  Game.aimNow = { x: p.x, y: p.y };
+  Game.aimStart = { x: cx, y: cy };
+  Game.aimNow = { x: cx, y: cy };
   Game.power = 0;
   powerEl.classList.add("show");
 }
 
 function inputMove(id, cx, cy) {
   if (!Game.aiming || id !== activePointer) return;
-  Game.aimNow = toWorld(cx, cy);
-  const dx = Game.aimStart.x - Game.aimNow.x, dy = Game.aimStart.y - Game.aimNow.y;
-  const len = Math.hypot(dx, dy);
-  Game.power = len < MIN_DRAG ? 0 : clamp((len - MIN_DRAG) / (MAX_DRAG - MIN_DRAG), 0, 1);
+  Game.aimNow = { x: cx, y: cy };
+  const len = Math.hypot(Game.aimStart.x - cx, Game.aimStart.y - cy);
+  Game.power = len < MIN_DRAG_PX ? 0 : clamp((len - MIN_DRAG_PX) / (MAX_DRAG_PX - MIN_DRAG_PX), 0, 1);
   powerFill.style.width = (Game.power * 100) + "%";
 }
 
 function inputEnd(id) {
   if (!Game.aiming || id !== activePointer) return;
-  Game.aiming = false;
-  activePointer = null;
-  powerEl.classList.remove("show");
   const dx = Game.aimStart.x - Game.aimNow.x, dy = Game.aimStart.y - Game.aimNow.y;
   const len = Math.hypot(dx, dy);
   const p = Game.power;
-  Game.power = 0;
-  powerFill.style.width = "0%";
-  if (len < MIN_DRAG || p <= 0.02) return;    // treated as a tap, not a shot
+  inputCancel();
+  if (len < MIN_DRAG_PX || p <= 0.02) return;    // a tap, not a shot
   shoot(dx / len, dy / len, p);
 }
 
@@ -1597,6 +2050,11 @@ document.addEventListener("touchmove", e => {
 }, { passive: false });
 document.addEventListener("gesturestart", e => e.preventDefault());
 document.addEventListener("contextmenu", e => e.preventDefault());
+
+/** Light haptics on phones that support it; quiet mode silences them too. */
+function buzz(ms) {
+  try { if (!Sound.muted && navigator.vibrate) navigator.vibrate(ms); } catch (e) {}
+}
 
 /* ============================ SCREENS / UI ================================ */
 const $ = id => document.getElementById(id);
@@ -1646,13 +2104,15 @@ function hideCoach() { clearTimeout(coachTimer); coachEl.classList.remove("show"
 /* Little one-line tips the first time a mechanic shows up. */
 const TIPS = {
   0: "Drag anywhere to aim · release to putt",
+  1: "Long hole! Tap 🗺 to see all of it",
   4: "Bumpers bounce you — use them!",
   5: "Sand slows the ball right down",
   6: "Water costs you a stroke",
-  8: "Time your shot past the block",
+  8: "Sliders can knock your ball — time it",
   9: "Ramps give you a speed boost",
-  10: "Stay on the path — don't get wet",
-  11: "Bank it off the walls"
+  10: "Cross the bridge to the island",
+  11: "Bank it off the angled wall",
+  12: "Windmills spin — wait for the gap"
 };
 
 function loadHole(i) {
@@ -1664,14 +2124,19 @@ function loadHole(i) {
   g.ball.vx = 0; g.ball.vy = 0; g.ball.moving = false; g.ball.sunk = false; g.ball.inSand = false;
   g.shotOrigin = { x: g.level.start.x, y: g.level.start.y };
   g.time = 0; g.shake = 0; g.sinkT = 0; g.slowTimer = 0;
-  g.particles.length = 0; g.ripples.length = 0;
+  g.particles.length = 0; g.ripples.length = 0; g.trail.length = 0;
   g.transition = 0;
-  g.aiming = false; g.power = 0;
+  inputCancel();
   completeShown = false;
   staticDirty = true;
+  setOverview(false);
+  // Holes too long for the screen open with a quick flyover from the flag.
+  Cam.introT = courseFits(g.level) ? 0 : 1.0;
+  updateCamera(0, true);
   syncHUD();
   hideCoach();                       // never carry a tip over from the last hole
-  if (TIPS[g.levelIndex]) showCoach(TIPS[g.levelIndex], 3400);
+  showBanner(g.level);
+  if (TIPS[g.levelIndex]) showCoach(TIPS[g.levelIndex], 3600);
 }
 
 function startRound(fromHole, keepScores) {
@@ -1837,8 +2302,45 @@ function syncMute() { btnMute.innerHTML = Sound.muted ? "&#128263;" : "&#128266;
 btnMute.addEventListener("click", () => { Sound.init(); Sound.setMuted(!Sound.muted); syncMute(); if (!Sound.muted) Sound.ui(); });
 syncMute();
 
+/* --------------------------- hole banner, overview ---------------------- */
+const bannerEl = $("banner");
+let bannerTimer = null;
+function showBanner(lvl) {
+  $("bnName").textContent = lvl.name;
+  const best = Store.data.bestHole[lvl.index];
+  $("bnMeta").textContent = "Hole " + (lvl.index + 1) + " \u00b7 Par " + lvl.par +
+    (typeof best === "number" ? " \u00b7 Best " + best : "");
+  bannerEl.classList.add("show");
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => bannerEl.classList.remove("show"), 2400);
+}
+
+const btnView = $("btnView");
+function setOverview(on) {
+  Cam.overview = on;
+  btnView.classList.toggle("active", on);
+  btnView.setAttribute("aria-pressed", on ? "true" : "false");
+  if (on) Cam.introT = 0;
+}
+btnView.addEventListener("click", () => { Sound.init(); Sound.ui(); setOverview(!Cam.overview); });
+
+/** Hooks the physics calls into. */
+function onShot() { if (Cam.overview) setOverview(false); }
+function onBallKnocked() { inputCancel(); }
+
 /* ============================ MAIN LOOP =================================== */
 let last = performance.now(), acc = 0;
+
+function updateTrail() {
+  const b = Game.ball, tr = Game.trail;
+  if (b.moving && Math.hypot(b.vx, b.vy) > 140) {
+    tr.push({ x: b.x, y: b.y });
+    if (tr.length > 14) tr.shift();
+  } else if (tr.length) {
+    tr.shift();
+  }
+}
+
 function frame(now) {
   let dt = (now - last) / 1000;
   last = now;
@@ -1853,10 +2355,12 @@ function frame(now) {
     if (acc > FIXED_DT) acc = 0;
 
     updateParticles(dt);
+    updateTrail();
     Game.shake *= Math.exp(-7 * dt);
     if (Game.transition < 1) Game.transition = Math.min(1, Game.transition + dt * 2.6);
     if (Game.ball.sunk) Game.sinkT += dt;
     for (const c of Game.level.bumpers) if (c.flash) c.flash = Math.max(0, c.flash - dt * 3.2);
+    updateCamera(dt, false);
   }
   render(t);
   requestAnimationFrame(frame);
@@ -1866,6 +2370,7 @@ function frame(now) {
 resize();
 Game.level = buildLevel(0);            // something pretty behind the home screen
 Game.ball.x = LEVELS[0].start[0]; Game.ball.y = LEVELS[0].start[1];
+updateCamera(0, true);
 refreshHome();
 document.addEventListener("visibilitychange", () => { last = performance.now(); acc = 0; });
 requestAnimationFrame(frame);
